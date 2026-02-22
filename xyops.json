@@ -1,0 +1,1127 @@
+{
+	"type": "xypdf",
+	"description": "xyOps Portable Data Object",
+	"version": "1.0",
+	"xyops": "1.0.3",
+	"items": [
+		{
+			"type": "plugin",
+			"data": {
+				"id": "ad01adinfo00001",
+				"title": "AD Info",
+				"enabled": true,
+				"type": "event",
+				"command": "pwsh",
+				"script": "#requires -Version 7.0\n# Copyright (c) 2026 xyOps. All rights reserved.\n<#!\nxyOps Active Directory Info Event Plugin v3.0 (PowerShell 7)\nA comprehensive collection of Active Directory query and reporting tools (25 tools):\n\nListing:          List Users, Groups, Computers, OUs\nInvestigation:    Group Membership, Group Members, User Detail\nSecurity:         Privileged Accounts, Service Accounts, Disabled Accounts, Password Policy\nInfrastructure:   Domain Info, Replication Status, Sites & Subnets, Trust Relationships, GPO Overview\nOperational:      Stale Accounts, Password Expiry, Locked Accounts, Empty Groups,\n                  Recent Changes, Account Expiration, Duplicate SPNs\nAdvanced:         LDAP Query, OU Comparison\nExport:           CSV, Markdown, HTML, or Excel (XLSX)\n\nPrerequisites:\n- ActiveDirectory PowerShell module (RSAT)\n- Domain-joined machine or connectivity to a domain controller\n- Account with at least Read access to AD objects\n- (Optional) ImportExcel module for XLSX export (auto-installed)\n\nI/O contract:\n- Read one JSON object from STDIN (job), write progress/messages as JSON lines of the\n  form: { \"xy\": 1, ... } to STDOUT.\n- On success, emit: { \"xy\": 1, \"code\": 0, \"data\": <result>, \"description\": \"...\" }\n- On error, emit:   { \"xy\": 1, \"code\": <nonzero>, \"description\": \"...\" } and exit 1.\n\nTest locally:\n  pwsh -NoProfile -ExecutionPolicy Bypass -File .\\adinfo.ps1 < job.json\n#>\n\nSet-StrictMode -Version Latest\n$ErrorActionPreference = 'Stop'\n\n#region xyOps Output Helpers\n\nfunction Write-XY {\n  param([hashtable]$Object)\n  $payload = [ordered]@{ xy = 1 }\n  foreach ($k in $Object.Keys) { $payload[$k] = $Object[$k] }\n  [Console]::Out.WriteLine(($payload | ConvertTo-Json -Depth 20 -Compress))\n  [Console]::Out.Flush()\n}\n\nfunction Write-XYProgress {\n  param([double]$Value, [string]$Status)\n  $o = @{ progress = [math]::Round($Value, 4) }\n  if ($Status) { $o.status = $Status }\n  Write-XY $o\n}\n\nfunction Write-XYSuccess {\n  param($Data, [string]$Description, [array]$Files = @())\n  $o = @{ code = 0; data = $Data }\n  if ($Description) { $o.description = $Description }\n  if ($Files.Count -gt 0) { $o.files = $Files }\n  Write-XY $o\n}\n\nfunction Write-XYError {\n  param([int]$Code, [string]$Description)\n  Write-XY @{ code = $Code; description = $Description }\n}\n\nfunction Read-JobFromStdin {\n  $raw = [Console]::In.ReadToEnd()\n  if ([string]::IsNullOrWhiteSpace($raw)) { throw 'No job JSON received on STDIN' }\n  return $raw | ConvertFrom-Json -ErrorAction Stop\n}\n\nfunction Get-Param {\n  param($Params, [string]$Name, $Default = $null)\n  if ($Params.PSObject.Properties.Name -contains $Name) { return $Params.$Name }\n  return $Default\n}\n\n#endregion\n\n#region Module Check\n\nfunction Assert-ActiveDirectoryModule {\n  Write-XYProgress 0.05 'Checking ActiveDirectory module...'\n\n  if (-not (Get-Module -ListAvailable -Name 'ActiveDirectory')) {\n    throw @\"\nActiveDirectory PowerShell module is not installed.\n\nTo install RSAT on Windows 10/11:\n  Add-WindowsCapability -Online -Name Rsat.ActiveDirectory.DS-LDS.Tools~~~~0.0.1.0\n\nOn Windows Server:\n  Install-WindowsFeature RSAT-AD-PowerShell\n\nThe machine must be domain-joined or able to reach a domain controller.\nThe account running xyOps must have at least Read access to Active Directory.\n\"@\n  }\n\n  Import-Module ActiveDirectory -ErrorAction Stop\n  Write-XYProgress 0.08 'ActiveDirectory module loaded'\n}\n\nfunction Install-ImportExcelModule {\n  if (Get-Module -ListAvailable -Name 'ImportExcel') {\n    Import-Module ImportExcel -ErrorAction Stop\n    return\n  }\n  Write-XYProgress 0.80 'Installing ImportExcel module...'\n  Install-Module -Name ImportExcel -Force -Scope CurrentUser -AllowClobber -ErrorAction Stop\n  Import-Module ImportExcel -ErrorAction Stop\n  Write-XYProgress 0.82 'ImportExcel module installed'\n}\n\nfunction Assert-GroupPolicyModule {\n  try {\n    if ($PSVersionTable.PSVersion.Major -ge 7) {\n      Import-Module GroupPolicy -UseWindowsPowerShell -WarningAction SilentlyContinue -ErrorAction Stop\n    } else {\n      Import-Module GroupPolicy -ErrorAction Stop\n    }\n  }\n  catch {\n    throw @\"\nGroupPolicy PowerShell module could not be loaded.\n\nOn Windows Server:\n  Install-WindowsFeature GPMC\n\nOn Windows 10/11:\n  Add-WindowsCapability -Online -Name Rsat.GroupPolicy.Management.Tools~~~~0.0.1.0\n\nIf GPMC is already installed and you are running PowerShell 7+, ensure the\nWindows PowerShell compatibility layer is working:\n  Import-Module GroupPolicy -UseWindowsPowerShell\n\"@\n  }\n}\n\n#endregion\n\n#region Field Definitions\n\nfunction Get-FieldDefinition {\n  param([string]$ObjectType, [string]$FieldSet)\n\n  $definitions = @{\n    users = @{\n      essential = @('Name', 'SamAccountName', 'Enabled', 'EmailAddress')\n      standard  = @('Name', 'SamAccountName', 'Enabled', 'EmailAddress',\n                     'DisplayName', 'Title', 'Department', 'Office')\n      extended  = @('Name', 'SamAccountName', 'Enabled', 'EmailAddress',\n                     'DisplayName', 'Title', 'Department', 'Office',\n                     'Manager', 'TelephoneNumber', 'Created', 'LastLogonDate',\n                     'PasswordLastSet', 'AccountExpirationDate')\n      all       = @('Name', 'SamAccountName', 'Enabled', 'EmailAddress',\n                     'DisplayName', 'Title', 'Department', 'Office',\n                     'Manager', 'TelephoneNumber', 'Created', 'LastLogonDate',\n                     'PasswordLastSet', 'AccountExpirationDate',\n                     'Description', 'DistinguishedName', 'SID', 'WhenChanged',\n                     'PasswordNeverExpires', 'LockedOut')\n      displayHeaders = @{\n        'Name'='Name'; 'SamAccountName'='Username'; 'Enabled'='Enabled';\n        'EmailAddress'='Email'; 'DisplayName'='Display Name'; 'Title'='Title';\n        'Department'='Department'; 'Office'='Office'; 'Manager'='Manager';\n        'TelephoneNumber'='Phone'; 'Created'='Created'; 'LastLogonDate'='Last Logon';\n        'PasswordLastSet'='Password Set'; 'AccountExpirationDate'='Expires';\n        'Description'='Description'; 'DistinguishedName'='DN'; 'SID'='SID';\n        'WhenChanged'='Modified'; 'PasswordNeverExpires'='Pwd Never Expires';\n        'LockedOut'='Locked Out'\n      }\n    }\n    groups = @{\n      essential = @('Name', 'GroupCategory', 'GroupScope', 'Description')\n      standard  = @('Name', 'GroupCategory', 'GroupScope', 'Description',\n                     'ManagedBy', 'MemberCount')\n      extended  = @('Name', 'GroupCategory', 'GroupScope', 'Description',\n                     'ManagedBy', 'MemberCount', 'Created', 'WhenChanged',\n                     'SID', 'DistinguishedName')\n      all       = @('Name', 'GroupCategory', 'GroupScope', 'Description',\n                     'ManagedBy', 'MemberCount', 'Created', 'WhenChanged',\n                     'SID', 'DistinguishedName', 'Mail', 'Info')\n      displayHeaders = @{\n        'Name'='Name'; 'GroupCategory'='Category'; 'GroupScope'='Scope';\n        'Description'='Description'; 'ManagedBy'='Managed By'; 'MemberCount'='Members';\n        'Created'='Created'; 'WhenChanged'='Modified'; 'SID'='SID';\n        'DistinguishedName'='DN'; 'Mail'='Email'; 'Info'='Info'\n      }\n    }\n    computers = @{\n      essential = @('Name', 'OperatingSystem', 'Enabled', 'IPv4Address')\n      standard  = @('Name', 'OperatingSystem', 'Enabled', 'IPv4Address',\n                     'OperatingSystemVersion', 'LastLogonDate', 'Description')\n      extended  = @('Name', 'OperatingSystem', 'Enabled', 'IPv4Address',\n                     'OperatingSystemVersion', 'LastLogonDate', 'Description',\n                     'Created', 'WhenChanged', 'Location', 'ManagedBy', 'DNSHostName')\n      all       = @('Name', 'OperatingSystem', 'Enabled', 'IPv4Address',\n                     'OperatingSystemVersion', 'LastLogonDate', 'Description',\n                     'Created', 'WhenChanged', 'Location', 'ManagedBy', 'DNSHostName',\n                     'DistinguishedName', 'SID', 'ServicePrincipalNames')\n      displayHeaders = @{\n        'Name'='Name'; 'OperatingSystem'='OS'; 'Enabled'='Enabled';\n        'IPv4Address'='IP Address'; 'OperatingSystemVersion'='OS Version';\n        'LastLogonDate'='Last Logon'; 'Description'='Description';\n        'Created'='Created'; 'WhenChanged'='Modified'; 'Location'='Location';\n        'ManagedBy'='Managed By'; 'DNSHostName'='DNS Name';\n        'DistinguishedName'='DN'; 'SID'='SID';\n        'ServicePrincipalNames'='SPNs'\n      }\n    }\n    ous = @{\n      essential = @('Name', 'DistinguishedName', 'Description')\n      standard  = @('Name', 'DistinguishedName', 'Description',\n                     'Created', 'WhenChanged', 'ManagedBy')\n      extended  = @('Name', 'DistinguishedName', 'Description',\n                     'Created', 'WhenChanged', 'ManagedBy',\n                     'ProtectedFromAccidentalDeletion', 'LinkedGroupPolicyObjects')\n      all       = @('Name', 'DistinguishedName', 'Description',\n                     'Created', 'WhenChanged', 'ManagedBy',\n                     'ProtectedFromAccidentalDeletion', 'LinkedGroupPolicyObjects',\n                     'City', 'Country', 'State')\n      displayHeaders = @{\n        'Name'='Name'; 'DistinguishedName'='DN'; 'Description'='Description';\n        'Created'='Created'; 'WhenChanged'='Modified'; 'ManagedBy'='Managed By';\n        'ProtectedFromAccidentalDeletion'='Protected'; 'LinkedGroupPolicyObjects'='GPOs';\n        'City'='City'; 'Country'='Country'; 'State'='State'\n      }\n    }\n  }\n\n  $typeDef = $definitions[$ObjectType]\n  if (-not $typeDef) { throw \"Unknown object type: $ObjectType\" }\n\n  $fields = $typeDef[$FieldSet]\n  if (-not $fields) { $fields = $typeDef['essential'] }\n\n  return @{\n    Fields         = $fields\n    DisplayHeaders = $typeDef.displayHeaders\n  }\n}\n\nfunction Get-ADProperties {\n  param([string]$ObjectType, [array]$Fields)\n\n  $computed = @('MemberCount')\n  $props = $Fields | Where-Object { $_ -notin $computed }\n\n  if ($ObjectType -eq 'groups' -and $Fields -contains 'MemberCount') {\n    if ($props -notcontains 'Members') { $props += 'Members' }\n  }\n\n  return $props\n}\n\n#endregion\n\n#region Formatting Helpers\n\nfunction Format-ADValue {\n  param($Value, [string]$PropertyName)\n\n  if ($null -eq $Value) { return '-' }\n\n  if ($Value -is [datetime]) {\n    if ($Value.Year -le 1601) { return 'Never' }\n    return $Value.ToString('yyyy-MM-dd HH:mm')\n  }\n\n  if ($Value -is [bool]) {\n    if ($Value) { return 'Yes' } else { return 'No' }\n  }\n\n  if ($Value -is [System.Security.Principal.SecurityIdentifier]) {\n    return $Value.ToString()\n  }\n\n  if ($PropertyName -eq 'GroupCategory') {\n    $catMap = @{ '0' = 'Distribution'; '1' = 'Security' }\n    $key = [string][int]$Value\n    return $(if ($catMap.ContainsKey($key)) { $catMap[$key] } else { [string]$Value })\n  }\n\n  if ($PropertyName -eq 'GroupScope') {\n    $scopeMap = @{ '0' = 'DomainLocal'; '1' = 'Global'; '2' = 'Universal' }\n    $key = [string][int]$Value\n    return $(if ($scopeMap.ContainsKey($key)) { $scopeMap[$key] } else { [string]$Value })\n  }\n\n  if ($PropertyName -in @('Manager', 'ManagedBy') -and $Value -is [string] -and $Value -match 'CN=([^,]+)') {\n    return $Matches[1]\n  }\n\n  if ($Value -is [System.Collections.IEnumerable] -and $Value -isnot [string]) {\n    $items = @($Value)\n    if ($items.Count -eq 0) { return '-' }\n    if ($items.Count -le 3) { return ($items -join ', ') }\n    return \"$($items[0..2] -join ', ') (+$($items.Count - 3) more)\"\n  }\n\n  $str = [string]$Value\n  if ([string]::IsNullOrWhiteSpace($str)) { return '-' }\n  return $str\n}\n\nfunction Format-MarkdownTable {\n  param([array]$Headers, [array]$Rows)\n\n  $sb = [System.Text.StringBuilder]::new()\n  [void]$sb.AppendLine(\"| $($Headers -join ' | ') |\")\n  $sep = ($Headers | ForEach-Object { '---' }) -join ' | '\n  [void]$sb.AppendLine(\"| $sep |\")\n  foreach ($row in $Rows) {\n    $escaped = $row | ForEach-Object { ([string]$_).Replace('|', '\\|') }\n    [void]$sb.AppendLine(\"| $($escaped -join ' | ') |\")\n  }\n  return $sb.ToString()\n}\n\n#endregion\n\n#region Common Query Helpers\n\nfunction Get-CommonQueryOpts {\n  param($Params)\n\n  $searchBase = (Get-Param $Params 'searchBase' '').Trim()\n  $searchScope = (Get-Param $Params 'searchScope' 'subtree').ToLower()\n  $nameFilter = (Get-Param $Params 'nameFilter' '').Trim()\n  $enabledOnly = if ($Params.PSObject.Properties.Name -contains 'enabledOnly') { [bool]$Params.enabledOnly } else { $false }\n  $fieldSet = (Get-Param $Params 'fieldSet' 'essential').ToLower()\n  $sortBy = (Get-Param $Params 'sortBy' 'name').ToLower()\n  $sortOrder = (Get-Param $Params 'sortOrder' 'ascending').ToLower()\n  $maxResultsStr = (Get-Param $Params 'maxResults' '1000').ToString().Trim()\n  $exportEnabled = if ($Params.PSObject.Properties.Name -contains 'exportEnabled') { [bool]$Params.exportEnabled } else { $false }\n  $exportFormat = (Get-Param $Params 'exportFormat' 'csv').ToLower()\n  $exportFileName = (Get-Param $Params 'exportFileName' 'ad_export').Trim()\n\n  $maxResults = 1000\n  if ($maxResultsStr -match '^\\d+$') { $maxResults = [int]$maxResultsStr }\n  $maxResults = [Math]::Min(10000, [Math]::Max(1, $maxResults))\n\n  $scopeMap = @{ 'base' = 'Base'; 'onelevel' = 'OneLevel'; 'subtree' = 'Subtree' }\n  $adSearchScope = if ($scopeMap.ContainsKey($searchScope)) { $scopeMap[$searchScope] } else { 'Subtree' }\n\n  if ($searchBase -and $searchBase -notmatch '(OU|DC|CN)=') {\n    throw \"Invalid SearchBase: '$searchBase'. Must be a valid distinguished name (e.g., OU=Users,DC=contoso,DC=com)\"\n  }\n\n  return @{\n    SearchBase     = $searchBase\n    SearchScope    = $adSearchScope\n    NameFilter     = $nameFilter\n    EnabledOnly    = $enabledOnly\n    FieldSet       = $fieldSet\n    SortBy         = $sortBy\n    SortOrder      = $sortOrder\n    MaxResults     = $maxResults\n    ExportEnabled  = $exportEnabled\n    ExportFormat   = $exportFormat\n    ExportFileName = $exportFileName\n  }\n}\n\nfunction Build-TableOutput {\n  param(\n    [array]$RawResults,\n    [hashtable]$FieldDef,\n    [string]$ObjectType,\n    [string]$Title,\n    [string]$CaptionText,\n    [hashtable]$QueryOpts\n  )\n\n  # Compute MemberCount for groups if needed\n  if ($ObjectType -eq 'groups' -and $FieldDef.Fields -contains 'MemberCount') {\n    foreach ($grp in $RawResults) {\n      $memberCount = 0\n      if ($grp.PSObject.Properties.Name -contains 'Members' -and $null -ne $grp.Members) {\n        $memberCount = @($grp.Members).Count\n      }\n      $grp | Add-Member -NotePropertyName 'MemberCount' -NotePropertyValue $memberCount -Force\n    }\n  }\n\n  # Sort\n  $sortPropMap = @{ 'name' = 'Name'; 'created' = 'Created'; 'modified' = 'WhenChanged' }\n  $sortProp = if ($sortPropMap.ContainsKey($QueryOpts.SortBy)) { $sortPropMap[$QueryOpts.SortBy] } else { 'Name' }\n  if ($RawResults.Count -gt 0 -and $RawResults[0].PSObject.Properties.Name -notcontains $sortProp) {\n    $sortProp = 'Name'\n  }\n\n  $sortedResults = @(if ($QueryOpts.SortOrder -eq 'descending') {\n    $RawResults | Sort-Object -Property $sortProp -Descending\n  } else {\n    $RawResults | Sort-Object -Property $sortProp\n  })\n\n  # Build headers and rows\n  $displayHeaders = @('#')\n  foreach ($f in $FieldDef.Fields) {\n    $header = if ($FieldDef.DisplayHeaders.ContainsKey($f)) { $FieldDef.DisplayHeaders[$f] } else { $f }\n    $displayHeaders += $header\n  }\n\n  $tableRows = @()\n  $dataRows = @()\n  $outputItems = [System.Collections.Generic.List[object]]::new()\n\n  $idx = 0\n  foreach ($item in $sortedResults) {\n    $idx++\n    $displayRow = @($idx)\n    $exportRow = @()\n    $outputObj = [ordered]@{}\n\n    foreach ($f in $FieldDef.Fields) {\n      $rawValue = $null\n      if ($item.PSObject.Properties.Name -contains $f) { $rawValue = $item.$f }\n      $formatted = Format-ADValue -Value $rawValue -PropertyName $f\n      $displayRow += $formatted\n      $exportRow += $formatted\n      $outputObj[$f] = $formatted\n    }\n\n    $tableRows += ,$displayRow\n    $dataRows += ,$exportRow\n    $outputItems.Add([pscustomobject]$outputObj)\n  }\n\n  return @{\n    SortedResults  = $sortedResults\n    DisplayHeaders = $displayHeaders\n    TableRows      = $tableRows\n    DataRows       = $dataRows\n    OutputItems    = $outputItems\n    ExportHeaders  = @($FieldDef.Fields | ForEach-Object {\n      if ($FieldDef.DisplayHeaders.ContainsKey($_)) { $FieldDef.DisplayHeaders[$_] } else { $_ }\n    })\n  }\n}\n\n#endregion\n\n#region AD Query Functions — List Tools\n\nfunction Invoke-ADUserList {\n  param($Params)\n\n  Write-XYProgress 0.10 'Preparing user query...'\n  $opts = Get-CommonQueryOpts $Params\n  $fieldDef = Get-FieldDefinition -ObjectType 'users' -FieldSet $opts.FieldSet\n\n  Write-XYProgress 0.25 'Querying Active Directory for users...'\n  $adParams = @{\n    Properties    = (Get-ADProperties 'users' $fieldDef.Fields)\n    ResultSetSize = $opts.MaxResults\n  }\n  if ($opts.SearchBase) { $adParams.SearchBase = $opts.SearchBase }\n  if ($opts.SearchScope) { $adParams.SearchScope = $opts.SearchScope }\n\n  $filters = @()\n  if ($opts.NameFilter) { $filters += \"Name -like '$($opts.NameFilter)'\" }\n  if ($opts.EnabledOnly) { $filters += \"Enabled -eq `$true\" }\n  $adParams.Filter = if ($filters.Count -gt 0) { $filters -join ' -and ' } else { '*' }\n\n  $results = @(Get-ADUser @adParams)\n  Write-XYProgress 0.50 \"Retrieved $($results.Count) user(s)\"\n\n  return Emit-ListResults -RawResults $results -FieldDef $fieldDef -ObjectType 'users' -TypeName 'Users' -Opts $opts\n}\n\nfunction Invoke-ADGroupList {\n  param($Params)\n\n  Write-XYProgress 0.10 'Preparing group query...'\n  $opts = Get-CommonQueryOpts $Params\n  $fieldDef = Get-FieldDefinition -ObjectType 'groups' -FieldSet $opts.FieldSet\n\n  Write-XYProgress 0.25 'Querying Active Directory for groups...'\n  $adParams = @{\n    Properties    = (Get-ADProperties 'groups' $fieldDef.Fields)\n    ResultSetSize = $opts.MaxResults\n  }\n  if ($opts.SearchBase) { $adParams.SearchBase = $opts.SearchBase }\n  if ($opts.SearchScope) { $adParams.SearchScope = $opts.SearchScope }\n\n  $adParams.Filter = if ($opts.NameFilter) { \"Name -like '$($opts.NameFilter)'\" } else { '*' }\n\n  $results = @(Get-ADGroup @adParams)\n  Write-XYProgress 0.50 \"Retrieved $($results.Count) group(s)\"\n\n  return Emit-ListResults -RawResults $results -FieldDef $fieldDef -ObjectType 'groups' -TypeName 'Groups' -Opts $opts\n}\n\nfunction Invoke-ADComputerList {\n  param($Params)\n\n  Write-XYProgress 0.10 'Preparing computer query...'\n  $opts = Get-CommonQueryOpts $Params\n  $fieldDef = Get-FieldDefinition -ObjectType 'computers' -FieldSet $opts.FieldSet\n\n  Write-XYProgress 0.25 'Querying Active Directory for computers...'\n  $adParams = @{\n    Properties    = (Get-ADProperties 'computers' $fieldDef.Fields)\n    ResultSetSize = $opts.MaxResults\n  }\n  if ($opts.SearchBase) { $adParams.SearchBase = $opts.SearchBase }\n  if ($opts.SearchScope) { $adParams.SearchScope = $opts.SearchScope }\n\n  $filters = @()\n  if ($opts.NameFilter) { $filters += \"Name -like '$($opts.NameFilter)'\" }\n  if ($opts.EnabledOnly) { $filters += \"Enabled -eq `$true\" }\n  $adParams.Filter = if ($filters.Count -gt 0) { $filters -join ' -and ' } else { '*' }\n\n  $results = @(Get-ADComputer @adParams)\n  Write-XYProgress 0.50 \"Retrieved $($results.Count) computer(s)\"\n\n  return Emit-ListResults -RawResults $results -FieldDef $fieldDef -ObjectType 'computers' -TypeName 'Computers' -Opts $opts\n}\n\nfunction Invoke-ADOUList {\n  param($Params)\n\n  Write-XYProgress 0.10 'Preparing OU query...'\n  $opts = Get-CommonQueryOpts $Params\n  $fieldDef = Get-FieldDefinition -ObjectType 'ous' -FieldSet $opts.FieldSet\n\n  Write-XYProgress 0.25 'Querying Active Directory for organizational units...'\n  $adParams = @{\n    Properties    = (Get-ADProperties 'ous' $fieldDef.Fields)\n    ResultSetSize = $opts.MaxResults\n  }\n  if ($opts.SearchBase) { $adParams.SearchBase = $opts.SearchBase }\n  if ($opts.SearchScope) { $adParams.SearchScope = $opts.SearchScope }\n\n  $adParams.Filter = if ($opts.NameFilter) { \"Name -like '$($opts.NameFilter)'\" } else { '*' }\n\n  $results = @(Get-ADOrganizationalUnit @adParams)\n  Write-XYProgress 0.50 \"Retrieved $($results.Count) OU(s)\"\n\n  return Emit-ListResults -RawResults $results -FieldDef $fieldDef -ObjectType 'ous' -TypeName 'Organizational Units' -Opts $opts\n}\n\n#endregion\n\n#region AD Query Functions — New Tools\n\nfunction Invoke-GroupMembership {\n  param($Params)\n\n  $targetUser = (Get-Param $Params 'targetUser' '').Trim()\n  if (-not $targetUser) { throw 'No target user specified. Provide a SamAccountName or Distinguished Name.' }\n\n  Write-XYProgress 0.20 \"Looking up group membership for '$targetUser'...\"\n\n  # Resolve the user\n  $user = Get-ADUser -Identity $targetUser -Properties DisplayName, SamAccountName -ErrorAction Stop\n  Write-XYProgress 0.35 \"Found user: $($user.Name) ($($user.SamAccountName))\"\n\n  # Get all groups (recursive)\n  $groups = @(Get-ADPrincipalGroupMembership -Identity $user -ErrorAction Stop)\n\n  # Get extended info for each group\n  Write-XYProgress 0.50 \"Retrieving details for $($groups.Count) group(s)...\"\n  $detailedGroups = @()\n  foreach ($g in $groups) {\n    $detail = Get-ADGroup -Identity $g.DistinguishedName -Properties GroupCategory, GroupScope, Description, ManagedBy -ErrorAction SilentlyContinue\n    if ($detail) { $detailedGroups += $detail }\n  }\n\n  Write-XYProgress 0.70 'Building output...'\n\n  $displayHeaders = @('#', 'Group Name', 'Category', 'Scope', 'Description')\n  $tableRows = @()\n  $dataRows = @()\n  $idx = 0\n  foreach ($g in ($detailedGroups | Sort-Object Name)) {\n    $idx++\n    $desc = if ($g.Description) { $g.Description } else { '-' }\n    $cat = Format-ADValue -Value $g.GroupCategory -PropertyName 'GroupCategory'\n    $scope = Format-ADValue -Value $g.GroupScope -PropertyName 'GroupScope'\n    $tableRows += ,@($idx, $g.Name, $cat, $scope, $desc)\n    $dataRows += ,@($g.Name, $cat, $scope, $desc)\n  }\n\n  $captionText = \"User '$($user.SamAccountName)' is a member of $($detailedGroups.Count) group(s)\"\n\n  # Export if requested\n  $opts = Get-CommonQueryOpts $Params\n  $generatedFiles = @()\n  if ($opts.ExportEnabled) {\n    $exportHeaders = @('Group Name', 'Category', 'Scope', 'Description')\n    $exportPath = Export-ResultsToFile -Rows $dataRows -Headers $exportHeaders `\n      -Format $opts.ExportFormat -FileName $opts.ExportFileName -Title \"Group Membership - $($user.SamAccountName)\"\n    if ($exportPath -and (Test-Path $exportPath)) {\n      $generatedFiles += (Get-Item $exportPath).Name\n      $captionText += \" | Exported: $((Get-Item $exportPath).Name)\"\n    }\n  }\n\n  Write-XY @{ table = @{ title = \"Group Membership — $($user.Name)\"; header = $displayHeaders; rows = $tableRows; caption = $captionText } }\n\n  return [PSCustomObject]@{\n    tool = 'Group Membership'; success = $true; targetUser = $user.SamAccountName\n    totalGroups = $detailedGroups.Count; generatedFiles = $generatedFiles\n  }\n}\n\nfunction Invoke-GroupMembers {\n  param($Params)\n\n  $targetGroup = (Get-Param $Params 'targetGroup' '').Trim()\n  if (-not $targetGroup) { throw 'No target group specified. Provide a group Name, SamAccountName, or Distinguished Name.' }\n\n  $recursive = if ($Params.PSObject.Properties.Name -contains 'recursive') { [bool]$Params.recursive } else { $false }\n\n  Write-XYProgress 0.20 \"Looking up members of '$targetGroup'...\"\n\n  $group = Get-ADGroup -Identity $targetGroup -Properties Description -ErrorAction Stop\n  Write-XYProgress 0.35 \"Found group: $($group.Name)\"\n\n  $memberParams = @{ Identity = $group }\n  if ($recursive) { $memberParams.Recursive = $true }\n\n  $members = @(Get-ADGroupMember @memberParams -ErrorAction Stop)\n  Write-XYProgress 0.55 \"Found $($members.Count) member(s)\"\n\n  # Get additional properties for each member\n  Write-XYProgress 0.60 'Retrieving member details...'\n  $detailedMembers = [System.Collections.Generic.List[object]]::new()\n  foreach ($m in $members) {\n    $obj = [ordered]@{ Name = $m.Name; SamAccountName = $m.SamAccountName; ObjectClass = $m.objectClass; Enabled = '-' }\n    if ($m.objectClass -eq 'user') {\n      try {\n        $u = Get-ADUser -Identity $m.SamAccountName -Properties Enabled -ErrorAction SilentlyContinue\n        if ($u) { $obj.Enabled = if ($u.Enabled) { 'Yes' } else { 'No' } }\n      } catch {}\n    } elseif ($m.objectClass -eq 'computer') {\n      try {\n        $c = Get-ADComputer -Identity $m.SamAccountName -Properties Enabled -ErrorAction SilentlyContinue\n        if ($c) { $obj.Enabled = if ($c.Enabled) { 'Yes' } else { 'No' } }\n      } catch {}\n    }\n    $detailedMembers.Add([pscustomobject]$obj)\n  }\n\n  Write-XYProgress 0.75 'Building output...'\n\n  $displayHeaders = @('#', 'Name', 'Username', 'Type', 'Enabled')\n  $tableRows = @()\n  $dataRows = @()\n  $idx = 0\n  foreach ($m in ($detailedMembers | Sort-Object Name)) {\n    $idx++\n    $tableRows += ,@($idx, $m.Name, $m.SamAccountName, $m.ObjectClass, $m.Enabled)\n    $dataRows += ,@($m.Name, $m.SamAccountName, $m.ObjectClass, $m.Enabled)\n  }\n\n  $modeText = if ($recursive) { 'recursive' } else { 'direct' }\n  $captionText = \"Group '$($group.Name)' has $($detailedMembers.Count) $modeText member(s)\"\n\n  $opts = Get-CommonQueryOpts $Params\n  $generatedFiles = @()\n  if ($opts.ExportEnabled) {\n    $exportHeaders = @('Name', 'Username', 'Type', 'Enabled')\n    $exportPath = Export-ResultsToFile -Rows $dataRows -Headers $exportHeaders `\n      -Format $opts.ExportFormat -FileName $opts.ExportFileName -Title \"Group Members - $($group.Name)\"\n    if ($exportPath -and (Test-Path $exportPath)) {\n      $generatedFiles += (Get-Item $exportPath).Name\n      $captionText += \" | Exported: $((Get-Item $exportPath).Name)\"\n    }\n  }\n\n  Write-XY @{ table = @{ title = \"Group Members — $($group.Name)\"; header = $displayHeaders; rows = $tableRows; caption = $captionText } }\n\n  return [PSCustomObject]@{\n    tool = 'Group Members'; success = $true; targetGroup = $group.Name\n    recursive = $recursive; totalMembers = $detailedMembers.Count; generatedFiles = $generatedFiles\n  }\n}\n\nfunction Invoke-StaleAccounts {\n  param($Params)\n\n  $staleDaysStr = (Get-Param $Params 'staleDays' '90').ToString().Trim()\n  $staleDays = 90\n  if ($staleDaysStr -match '^\\d+$') { $staleDays = [int]$staleDaysStr }\n  $staleDays = [Math]::Max(1, $staleDays)\n\n  $staleType = (Get-Param $Params 'staleObjectType' 'users').ToLower()\n  $searchBase = (Get-Param $Params 'searchBase' '').Trim()\n\n  $cutoffDate = (Get-Date).AddDays(-$staleDays)\n  Write-XYProgress 0.15 \"Finding accounts not logged in since $($cutoffDate.ToString('yyyy-MM-dd'))...\"\n\n  $allResults = @()\n\n  if ($staleType -in @('users', 'both')) {\n    Write-XYProgress 0.25 'Querying stale user accounts...'\n    $userParams = @{\n      Filter     = \"LastLogonDate -lt '$($cutoffDate.ToString('yyyy-MM-ddTHH:mm:ss'))' -or LastLogonDate -notlike '*'\"\n      Properties = @('Name', 'SamAccountName', 'Enabled', 'LastLogonDate', 'PasswordLastSet', 'Created', 'Description', 'DistinguishedName')\n    }\n    if ($searchBase) { $userParams.SearchBase = $searchBase }\n    $staleUsers = @(Get-ADUser @userParams)\n    # Filter more precisely in PowerShell (AD filter for null dates can be tricky)\n    $staleUsers = @($staleUsers | Where-Object { $null -eq $_.LastLogonDate -or $_.LastLogonDate -lt $cutoffDate })\n    foreach ($u in $staleUsers) {\n      $u | Add-Member -NotePropertyName 'ObjectType' -NotePropertyValue 'User' -Force\n    }\n    $allResults += $staleUsers\n  }\n\n  if ($staleType -in @('computers', 'both')) {\n    Write-XYProgress 0.45 'Querying stale computer accounts...'\n    $compParams = @{\n      Filter     = \"LastLogonDate -lt '$($cutoffDate.ToString('yyyy-MM-ddTHH:mm:ss'))' -or LastLogonDate -notlike '*'\"\n      Properties = @('Name', 'SamAccountName', 'Enabled', 'LastLogonDate', 'OperatingSystem', 'Created', 'Description', 'DistinguishedName')\n    }\n    if ($searchBase) { $compParams.SearchBase = $searchBase }\n    $staleComps = @(Get-ADComputer @compParams)\n    $staleComps = @($staleComps | Where-Object { $null -eq $_.LastLogonDate -or $_.LastLogonDate -lt $cutoffDate })\n    foreach ($c in $staleComps) {\n      $c | Add-Member -NotePropertyName 'ObjectType' -NotePropertyValue 'Computer' -Force\n    }\n    $allResults += $staleComps\n  }\n\n  Write-XYProgress 0.65 \"Found $($allResults.Count) stale account(s)\"\n\n  $displayHeaders = @('#', 'Name', 'Username', 'Type', 'Enabled', 'Last Logon', 'Created')\n  $tableRows = @()\n  $dataRows = @()\n  $idx = 0\n  foreach ($item in ($allResults | Sort-Object LastLogonDate)) {\n    $idx++\n    $enabled = Format-ADValue -Value $item.Enabled -PropertyName 'Enabled'\n    $lastLogon = Format-ADValue -Value $item.LastLogonDate -PropertyName 'LastLogonDate'\n    $created = Format-ADValue -Value $item.Created -PropertyName 'Created'\n    $tableRows += ,@($idx, $item.Name, $item.SamAccountName, $item.ObjectType, $enabled, $lastLogon, $created)\n    $dataRows += ,@($item.Name, $item.SamAccountName, $item.ObjectType, $enabled, $lastLogon, $created)\n  }\n\n  $captionText = \"Found $($allResults.Count) account(s) with no logon in $staleDays+ days\"\n\n  $opts = Get-CommonQueryOpts $Params\n  $generatedFiles = @()\n  if ($opts.ExportEnabled) {\n    $exportHeaders = @('Name', 'Username', 'Type', 'Enabled', 'Last Logon', 'Created')\n    $exportPath = Export-ResultsToFile -Rows $dataRows -Headers $exportHeaders `\n      -Format $opts.ExportFormat -FileName $opts.ExportFileName -Title \"Stale Accounts ($staleDays+ days)\"\n    if ($exportPath -and (Test-Path $exportPath)) {\n      $generatedFiles += (Get-Item $exportPath).Name\n      $captionText += \" | Exported: $((Get-Item $exportPath).Name)\"\n    }\n  }\n\n  Write-XY @{ table = @{ title = \"Stale Accounts ($staleDays+ Days)\"; header = $displayHeaders; rows = $tableRows; caption = $captionText } }\n\n  return [PSCustomObject]@{\n    tool = 'Stale Accounts'; success = $true; staleDays = $staleDays\n    objectType = $staleType; totalResults = $allResults.Count; generatedFiles = $generatedFiles\n  }\n}\n\nfunction Invoke-PasswordExpiry {\n  param($Params)\n\n  $expiryDaysStr = (Get-Param $Params 'expiryDays' '14').ToString().Trim()\n  $expiryDays = 14\n  if ($expiryDaysStr -match '^\\d+$') { $expiryDays = [int]$expiryDaysStr }\n  $expiryDays = [Math]::Max(1, $expiryDays)\n\n  $searchBase = (Get-Param $Params 'searchBase' '').Trim()\n\n  Write-XYProgress 0.20 \"Finding users with passwords expiring within $expiryDays days...\"\n\n  $userParams = @{\n    Filter     = \"Enabled -eq `$true -and PasswordNeverExpires -eq `$false\"\n    Properties = @('Name', 'SamAccountName', 'EmailAddress', 'PasswordLastSet',\n                   'msDS-UserPasswordExpiryTimeComputed', 'PasswordNeverExpires',\n                   'Department', 'Title')\n  }\n  if ($searchBase) { $userParams.SearchBase = $searchBase }\n\n  $users = @(Get-ADUser @userParams)\n  Write-XYProgress 0.50 \"Checking $($users.Count) user(s)...\"\n\n  $now = Get-Date\n  $expiringUsers = [System.Collections.Generic.List[object]]::new()\n\n  foreach ($u in $users) {\n    $expiryTimeRaw = $u.'msDS-UserPasswordExpiryTimeComputed'\n    if ($null -eq $expiryTimeRaw -or $expiryTimeRaw -le 0) { continue }\n    try {\n      $expiryDate = [datetime]::FromFileTime($expiryTimeRaw)\n      $daysLeft = [Math]::Floor(($expiryDate - $now).TotalDays)\n      if ($daysLeft -le $expiryDays) {\n        $u | Add-Member -NotePropertyName 'ExpiryDate' -NotePropertyValue $expiryDate -Force\n        $u | Add-Member -NotePropertyName 'DaysLeft' -NotePropertyValue $daysLeft -Force\n        $expiringUsers.Add($u)\n      }\n    } catch {}\n  }\n\n  Write-XYProgress 0.70 \"Found $($expiringUsers.Count) user(s) with expiring passwords\"\n\n  $displayHeaders = @('#', 'Name', 'Username', 'Email', 'Pwd Set', 'Expires', 'Days Left')\n  $tableRows = @()\n  $dataRows = @()\n  $idx = 0\n  foreach ($u in ($expiringUsers | Sort-Object DaysLeft)) {\n    $idx++\n    $email = if ($u.EmailAddress) { $u.EmailAddress } else { '-' }\n    $pwdSet = Format-ADValue -Value $u.PasswordLastSet -PropertyName 'PasswordLastSet'\n    $expires = $u.ExpiryDate.ToString('yyyy-MM-dd HH:mm')\n    $daysStr = if ($u.DaysLeft -lt 0) { \"EXPIRED ($($u.DaysLeft)d)\" } elseif ($u.DaysLeft -eq 0) { 'TODAY' } else { \"$($u.DaysLeft)d\" }\n    $tableRows += ,@($idx, $u.Name, $u.SamAccountName, $email, $pwdSet, $expires, $daysStr)\n    $dataRows += ,@($u.Name, $u.SamAccountName, $email, $pwdSet, $expires, $daysStr)\n  }\n\n  $captionText = \"Found $($expiringUsers.Count) user(s) with password expiring within $expiryDays days\"\n\n  $opts = Get-CommonQueryOpts $Params\n  $generatedFiles = @()\n  if ($opts.ExportEnabled) {\n    $exportHeaders = @('Name', 'Username', 'Email', 'Pwd Set', 'Expires', 'Days Left')\n    $exportPath = Export-ResultsToFile -Rows $dataRows -Headers $exportHeaders `\n      -Format $opts.ExportFormat -FileName $opts.ExportFileName -Title \"Password Expiry Report ($expiryDays days)\"\n    if ($exportPath -and (Test-Path $exportPath)) {\n      $generatedFiles += (Get-Item $exportPath).Name\n      $captionText += \" | Exported: $((Get-Item $exportPath).Name)\"\n    }\n  }\n\n  Write-XY @{ table = @{ title = \"Password Expiry Report ($expiryDays Days)\"; header = $displayHeaders; rows = $tableRows; caption = $captionText } }\n\n  return [PSCustomObject]@{\n    tool = 'Password Expiry'; success = $true; expiryDays = $expiryDays\n    totalResults = $expiringUsers.Count; generatedFiles = $generatedFiles\n  }\n}\n\nfunction Invoke-LockedAccounts {\n  param($Params)\n\n  Write-XYProgress 0.20 'Searching for locked-out accounts...'\n\n  $locked = @(Search-ADAccount -LockedOut -UsersOnly -ErrorAction Stop)\n  Write-XYProgress 0.45 \"Found $($locked.Count) locked account(s)\"\n\n  # Get additional details\n  $detailedLocked = [System.Collections.Generic.List[object]]::new()\n  foreach ($l in $locked) {\n    try {\n      $u = Get-ADUser -Identity $l.SamAccountName -Properties Name, SamAccountName, Enabled,\n        EmailAddress, LockedOut, AccountLockoutTime, BadLogonCount, LastLogonDate -ErrorAction SilentlyContinue\n      if ($u) { $detailedLocked.Add($u) }\n    } catch {}\n  }\n\n  Write-XYProgress 0.70 'Building output...'\n\n  $displayHeaders = @('#', 'Name', 'Username', 'Email', 'Lockout Time', 'Bad Logons', 'Last Logon')\n  $tableRows = @()\n  $dataRows = @()\n  $idx = 0\n  foreach ($u in ($detailedLocked | Sort-Object AccountLockoutTime -Descending)) {\n    $idx++\n    $email = if ($u.EmailAddress) { $u.EmailAddress } else { '-' }\n    $lockTime = Format-ADValue -Value $u.AccountLockoutTime -PropertyName 'AccountLockoutTime'\n    $badLogons = if ($null -ne $u.BadLogonCount) { $u.BadLogonCount } else { '-' }\n    $lastLogon = Format-ADValue -Value $u.LastLogonDate -PropertyName 'LastLogonDate'\n    $tableRows += ,@($idx, $u.Name, $u.SamAccountName, $email, $lockTime, $badLogons, $lastLogon)\n    $dataRows += ,@($u.Name, $u.SamAccountName, $email, $lockTime, $badLogons, $lastLogon)\n  }\n\n  $captionText = \"Found $($detailedLocked.Count) currently locked-out account(s)\"\n\n  $opts = Get-CommonQueryOpts $Params\n  $generatedFiles = @()\n  if ($opts.ExportEnabled) {\n    $exportHeaders = @('Name', 'Username', 'Email', 'Lockout Time', 'Bad Logons', 'Last Logon')\n    $exportPath = Export-ResultsToFile -Rows $dataRows -Headers $exportHeaders `\n      -Format $opts.ExportFormat -FileName $opts.ExportFileName -Title 'Locked Out Accounts'\n    if ($exportPath -and (Test-Path $exportPath)) {\n      $generatedFiles += (Get-Item $exportPath).Name\n      $captionText += \" | Exported: $((Get-Item $exportPath).Name)\"\n    }\n  }\n\n  Write-XY @{ table = @{ title = 'Locked Out Accounts'; header = $displayHeaders; rows = $tableRows; caption = $captionText } }\n\n  return [PSCustomObject]@{\n    tool = 'Locked Accounts'; success = $true\n    totalResults = $detailedLocked.Count; generatedFiles = $generatedFiles\n  }\n}\n\nfunction Invoke-EmptyGroups {\n  param($Params)\n\n  $searchBase = (Get-Param $Params 'searchBase' '').Trim()\n\n  Write-XYProgress 0.20 'Querying all groups...'\n\n  $groupParams = @{\n    Filter     = '*'\n    Properties = @('Name', 'GroupCategory', 'GroupScope', 'Description', 'Members', 'ManagedBy', 'Created')\n  }\n  if ($searchBase) { $groupParams.SearchBase = $searchBase }\n\n  $allGroups = @(Get-ADGroup @groupParams)\n  Write-XYProgress 0.50 \"Checking $($allGroups.Count) group(s) for empty membership...\"\n\n  $emptyGroups = @($allGroups | Where-Object { $null -eq $_.Members -or @($_.Members).Count -eq 0 })\n  Write-XYProgress 0.70 \"Found $($emptyGroups.Count) empty group(s)\"\n\n  $displayHeaders = @('#', 'Name', 'Category', 'Scope', 'Description', 'Managed By', 'Created')\n  $tableRows = @()\n  $dataRows = @()\n  $idx = 0\n  foreach ($g in ($emptyGroups | Sort-Object Name)) {\n    $idx++\n    $desc = if ($g.Description) { $g.Description } else { '-' }\n    $managedBy = Format-ADValue -Value $g.ManagedBy -PropertyName 'ManagedBy'\n    $created = Format-ADValue -Value $g.Created -PropertyName 'Created'\n    $cat = Format-ADValue -Value $g.GroupCategory -PropertyName 'GroupCategory'\n    $scope = Format-ADValue -Value $g.GroupScope -PropertyName 'GroupScope'\n    $tableRows += ,@($idx, $g.Name, $cat, $scope, $desc, $managedBy, $created)\n    $dataRows += ,@($g.Name, $cat, $scope, $desc, $managedBy, $created)\n  }\n\n  $captionText = \"Found $($emptyGroups.Count) empty group(s) out of $($allGroups.Count) total\"\n\n  $opts = Get-CommonQueryOpts $Params\n  $generatedFiles = @()\n  if ($opts.ExportEnabled) {\n    $exportHeaders = @('Name', 'Category', 'Scope', 'Description', 'Managed By', 'Created')\n    $exportPath = Export-ResultsToFile -Rows $dataRows -Headers $exportHeaders `\n      -Format $opts.ExportFormat -FileName $opts.ExportFileName -Title 'Empty Groups'\n    if ($exportPath -and (Test-Path $exportPath)) {\n      $generatedFiles += (Get-Item $exportPath).Name\n      $captionText += \" | Exported: $((Get-Item $exportPath).Name)\"\n    }\n  }\n\n  Write-XY @{ table = @{ title = 'Empty Groups'; header = $displayHeaders; rows = $tableRows; caption = $captionText } }\n\n  return [PSCustomObject]@{\n    tool = 'Empty Groups'; success = $true\n    totalEmpty = $emptyGroups.Count; totalGroups = $allGroups.Count; generatedFiles = $generatedFiles\n  }\n}\n\nfunction Invoke-DomainInfo {\n  param($Params)\n\n  Write-XYProgress 0.15 'Querying domain information...'\n  $domain = Get-ADDomain -ErrorAction Stop\n\n  Write-XYProgress 0.30 'Querying forest information...'\n  $forest = Get-ADForest -ErrorAction Stop\n\n  Write-XYProgress 0.50 'Querying domain controllers...'\n  $dcs = @(Get-ADDomainController -Filter * -ErrorAction Stop)\n\n  Write-XYProgress 0.70 'Building output...'\n\n  # Domain info table\n  $domainRows = @(\n    @('Domain Name', $domain.DNSRoot),\n    @('NetBIOS Name', $domain.NetBIOSName),\n    @('Domain Functional Level', $domain.DomainMode),\n    @('Forest Functional Level', $forest.ForestMode),\n    @('Forest Name', $forest.Name),\n    @('Domain SID', $domain.DomainSID.ToString()),\n    @('Infrastructure Master', $domain.InfrastructureMaster),\n    @('RID Master', $domain.RIDMaster),\n    @('PDC Emulator', $domain.PDCEmulator),\n    @('Domain Naming Master', $forest.DomainNamingMaster),\n    @('Schema Master', $forest.SchemaMaster)\n  )\n\n  # DC table\n  $dcHeaders = @('#', 'Name', 'IPv4', 'Site', 'OS', 'FSMO Roles', 'Global Catalog')\n  $dcRows = @()\n  $idx = 0\n  foreach ($dc in ($dcs | Sort-Object Name)) {\n    $idx++\n    $roles = @()\n    if ($dc.OperationMasterRoles) { $roles = @($dc.OperationMasterRoles) }\n    $rolesStr = if ($roles.Count -gt 0) { $roles -join ', ' } else { '-' }\n    $gc = if ($dc.IsGlobalCatalog) { 'Yes' } else { 'No' }\n    $dcRows += ,@($idx, $dc.Name, $dc.IPv4Address, $dc.Site, $dc.OperatingSystem, $rolesStr, $gc)\n  }\n\n  Write-XY @{ table = @{\n    title = \"Domain — $($domain.DNSRoot)\"\n    header = @('Property', 'Value')\n    rows = $domainRows\n    caption = \"$($dcs.Count) domain controller(s) | Forest: $($forest.Name)\"\n  } }\n\n  # xyOps only shows the LAST table, so we emit DCs as the final table\n  Write-XY @{ table = @{\n    title = 'Domain Controllers'\n    header = $dcHeaders\n    rows = $dcRows\n    caption = \"$($dcs.Count) DC(s) across $(@($dcs | Select-Object -ExpandProperty Site -Unique).Count) site(s)\"\n  } }\n\n  return [PSCustomObject]@{\n    tool = 'Domain Info'; success = $true; domainName = $domain.DNSRoot\n    forestName = $forest.Name; dcCount = $dcs.Count; generatedFiles = @()\n  }\n}\n\nfunction Invoke-LdapQuery {\n  param($Params)\n\n  $ldapFilter = (Get-Param $Params 'ldapFilter' '').Trim()\n  if (-not $ldapFilter) { throw 'No LDAP filter specified. Example: (&(objectClass=user)(department=IT))' }\n\n  $ldapPropsStr = (Get-Param $Params 'ldapProperties' 'Name,SamAccountName,ObjectClass').Trim()\n  $ldapProps = @($ldapPropsStr -split '[,;\\s]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })\n  if ($ldapProps.Count -eq 0) { $ldapProps = @('Name', 'SamAccountName', 'ObjectClass') }\n\n  $searchBase = (Get-Param $Params 'searchBase' '').Trim()\n  $maxResultsStr = (Get-Param $Params 'maxResults' '1000').ToString().Trim()\n  $maxResults = 1000\n  if ($maxResultsStr -match '^\\d+$') { $maxResults = [int]$maxResultsStr }\n  $maxResults = [Math]::Min(10000, [Math]::Max(1, $maxResults))\n\n  Write-XYProgress 0.20 \"Running LDAP query...\"\n\n  $adParams = @{\n    LDAPFilter    = $ldapFilter\n    Properties    = $ldapProps\n    ResultSetSize = $maxResults\n  }\n  if ($searchBase) { $adParams.SearchBase = $searchBase }\n\n  $results = @(Get-ADObject @adParams)\n  Write-XYProgress 0.60 \"Retrieved $($results.Count) object(s)\"\n\n  # Build table\n  $displayHeaders = @('#') + $ldapProps\n  $tableRows = @()\n  $dataRows = @()\n  $idx = 0\n  foreach ($item in $results) {\n    $idx++\n    $row = @($idx)\n    $exportRow = @()\n    foreach ($prop in $ldapProps) {\n      $val = $null\n      if ($item.PSObject.Properties.Name -contains $prop) { $val = $item.$prop }\n      $formatted = Format-ADValue -Value $val -PropertyName $prop\n      $row += $formatted\n      $exportRow += $formatted\n    }\n    $tableRows += ,$row\n    $dataRows += ,$exportRow\n  }\n\n  $captionText = \"LDAP filter returned $($results.Count) object(s) | Filter: $ldapFilter\"\n\n  $opts = Get-CommonQueryOpts $Params\n  $generatedFiles = @()\n  if ($opts.ExportEnabled) {\n    $exportPath = Export-ResultsToFile -Rows $dataRows -Headers $ldapProps `\n      -Format $opts.ExportFormat -FileName $opts.ExportFileName -Title 'LDAP Query Results'\n    if ($exportPath -and (Test-Path $exportPath)) {\n      $generatedFiles += (Get-Item $exportPath).Name\n      $captionText += \" | Exported: $((Get-Item $exportPath).Name)\"\n    }\n  }\n\n  Write-XY @{ table = @{ title = 'LDAP Query Results'; header = $displayHeaders; rows = $tableRows; caption = $captionText } }\n\n  return [PSCustomObject]@{\n    tool = 'LDAP Query'; success = $true; ldapFilter = $ldapFilter\n    totalResults = $results.Count; generatedFiles = $generatedFiles\n  }\n}\n\nfunction Invoke-CompareOUs {\n  param($Params)\n\n  $ou1 = (Get-Param $Params 'compareOU1' '').Trim()\n  $ou2 = (Get-Param $Params 'compareOU2' '').Trim()\n  $compareType = (Get-Param $Params 'compareObjectType' 'users').ToLower()\n\n  if (-not $ou1) { throw 'Compare OU 1 is required.' }\n  if (-not $ou2) { throw 'Compare OU 2 is required.' }\n\n  Write-XYProgress 0.15 \"Comparing $compareType between two OUs...\"\n\n  # Query OU 1\n  Write-XYProgress 0.25 \"Querying OU 1...\"\n  $items1 = @(switch ($compareType) {\n    'users'     { Get-ADUser -Filter * -SearchBase $ou1 -Properties Name, SamAccountName, Enabled, Department }\n    'groups'    { Get-ADGroup -Filter * -SearchBase $ou1 -Properties Name, GroupCategory, GroupScope }\n    'computers' { Get-ADComputer -Filter * -SearchBase $ou1 -Properties Name, OperatingSystem, Enabled }\n  })\n\n  # Query OU 2\n  Write-XYProgress 0.45 \"Querying OU 2...\"\n  $items2 = @(switch ($compareType) {\n    'users'     { Get-ADUser -Filter * -SearchBase $ou2 -Properties Name, SamAccountName, Enabled, Department }\n    'groups'    { Get-ADGroup -Filter * -SearchBase $ou2 -Properties Name, GroupCategory, GroupScope }\n    'computers' { Get-ADComputer -Filter * -SearchBase $ou2 -Properties Name, OperatingSystem, Enabled }\n  })\n\n  Write-XYProgress 0.65 'Comparing...'\n\n  $names1 = @($items1 | ForEach-Object { $_.SamAccountName ?? $_.Name })\n  $names2 = @($items2 | ForEach-Object { $_.SamAccountName ?? $_.Name })\n\n  $onlyIn1 = @($names1 | Where-Object { $_ -notin $names2 })\n  $onlyIn2 = @($names2 | Where-Object { $_ -notin $names1 })\n  $inBoth  = @($names1 | Where-Object { $_ -in $names2 })\n\n  # Summary table\n  $summaryRows = @(\n    @('OU 1', $ou1),\n    @('OU 2', $ou2),\n    @('Object Type', $compareType),\n    @(\"Total in OU 1\", $items1.Count),\n    @(\"Total in OU 2\", $items2.Count),\n    @('In Both', $inBoth.Count),\n    @('Only in OU 1', $onlyIn1.Count),\n    @('Only in OU 2', $onlyIn2.Count)\n  )\n\n  # Diff table — show items only in one OU\n  $diffHeaders = @('#', 'Name', 'Location')\n  $diffRows = @()\n  $dataRows = @()\n  $idx = 0\n  foreach ($name in ($onlyIn1 | Sort-Object)) {\n    $idx++\n    $diffRows += ,@($idx, $name, 'Only in OU 1')\n    $dataRows += ,@($name, 'Only in OU 1')\n  }\n  foreach ($name in ($onlyIn2 | Sort-Object)) {\n    $idx++\n    $diffRows += ,@($idx, $name, 'Only in OU 2')\n    $dataRows += ,@($name, 'Only in OU 2')\n  }\n\n  $captionText = \"$($inBoth.Count) in common | $($onlyIn1.Count) only in OU 1 | $($onlyIn2.Count) only in OU 2\"\n\n  $opts = Get-CommonQueryOpts $Params\n  $generatedFiles = @()\n  if ($opts.ExportEnabled) {\n    $exportHeaders = @('Name', 'Location')\n    $exportPath = Export-ResultsToFile -Rows $dataRows -Headers $exportHeaders `\n      -Format $opts.ExportFormat -FileName $opts.ExportFileName -Title 'OU Comparison'\n    if ($exportPath -and (Test-Path $exportPath)) {\n      $generatedFiles += (Get-Item $exportPath).Name\n      $captionText += \" | Exported: $((Get-Item $exportPath).Name)\"\n    }\n  }\n\n  # Emit summary first, then diff table (xyOps shows last table)\n  Write-XY @{ table = @{ title = 'OU Comparison Summary'; header = @('Property', 'Value'); rows = $summaryRows; caption = '' } }\n  Write-XY @{ table = @{ title = 'OU Differences'; header = $diffHeaders; rows = $diffRows; caption = $captionText } }\n\n  return [PSCustomObject]@{\n    tool = 'Compare OUs'; success = $true; compareType = $compareType\n    ou1Count = $items1.Count; ou2Count = $items2.Count\n    inBoth = $inBoth.Count; onlyInOU1 = $onlyIn1.Count; onlyInOU2 = $onlyIn2.Count\n    generatedFiles = $generatedFiles\n  }\n}\n\n#endregion\n\n#region AD Query Functions — v3.0 Security Tools\n\nfunction Invoke-PrivilegedAccounts {\n  param($Params)\n\n  Write-XYProgress 0.10 'Scanning privileged groups...'\n\n  $privilegedGroups = @(\n    'Domain Admins', 'Enterprise Admins', 'Schema Admins',\n    'Account Operators', 'Backup Operators', 'Server Operators',\n    'Print Operators', 'Administrators'\n  )\n\n  $allMembers = [System.Collections.Generic.List[object]]::new()\n  $groupIdx = 0\n  foreach ($groupName in $privilegedGroups) {\n    $groupIdx++\n    $pct = 0.10 + (0.55 * $groupIdx / $privilegedGroups.Count)\n    Write-XYProgress $pct \"Checking '$groupName'...\"\n    try {\n      $members = @(Get-ADGroupMember -Identity $groupName -Recursive -ErrorAction SilentlyContinue)\n      foreach ($m in $members) {\n        # Avoid duplicates\n        if ($allMembers | Where-Object { $_.SamAccountName -eq $m.SamAccountName -and $_.GroupName -eq $groupName }) { continue }\n        try {\n          $u = Get-ADUser -Identity $m.SamAccountName -Properties Name, SamAccountName, Enabled,\n            LastLogonDate, PasswordLastSet, PasswordNeverExpires, WhenCreated, Description -ErrorAction SilentlyContinue\n          if ($u) {\n            $u | Add-Member -NotePropertyName 'GroupName' -NotePropertyValue $groupName -Force\n            $pwdAge = if ($u.PasswordLastSet) { [Math]::Floor(((Get-Date) - $u.PasswordLastSet).TotalDays) } else { '-' }\n            $u | Add-Member -NotePropertyName 'PasswordAgeDays' -NotePropertyValue $pwdAge -Force\n            $allMembers.Add($u)\n          }\n        } catch {}\n      }\n    } catch {}\n  }\n\n  Write-XYProgress 0.70 'Building output...'\n\n  $displayHeaders = @('#', 'Name', 'Username', 'Privileged Group', 'Enabled', 'Last Logon', 'Pwd Age (Days)', 'Pwd Never Expires')\n  $tableRows = @()\n  $dataRows = @()\n  $idx = 0\n  foreach ($u in ($allMembers | Sort-Object GroupName, Name)) {\n    $idx++\n    $enabled = Format-ADValue -Value $u.Enabled -PropertyName 'Enabled'\n    $lastLogon = Format-ADValue -Value $u.LastLogonDate -PropertyName 'LastLogonDate'\n    $pwdNeverExpires = Format-ADValue -Value $u.PasswordNeverExpires -PropertyName 'PasswordNeverExpires'\n    $tableRows += ,@($idx, $u.Name, $u.SamAccountName, $u.GroupName, $enabled, $lastLogon, $u.PasswordAgeDays, $pwdNeverExpires)\n    $dataRows += ,@($u.Name, $u.SamAccountName, $u.GroupName, $enabled, $lastLogon, $u.PasswordAgeDays, $pwdNeverExpires)\n  }\n\n  # Deduplicate for unique user count\n  $uniqueUsers = @($allMembers | Select-Object -Property SamAccountName -Unique)\n  $captionText = \"$($allMembers.Count) membership(s) across $($privilegedGroups.Count) groups | $($uniqueUsers.Count) unique privileged user(s)\"\n\n  $opts = Get-CommonQueryOpts $Params\n  $generatedFiles = @()\n  if ($opts.ExportEnabled) {\n    $exportHeaders = @('Name', 'Username', 'Privileged Group', 'Enabled', 'Last Logon', 'Pwd Age (Days)', 'Pwd Never Expires')\n    $exportPath = Export-ResultsToFile -Rows $dataRows -Headers $exportHeaders `\n      -Format $opts.ExportFormat -FileName $opts.ExportFileName -Title 'Privileged Accounts Audit'\n    if ($exportPath -and (Test-Path $exportPath)) {\n      $generatedFiles += (Get-Item $exportPath).Name\n      $captionText += \" | Exported: $((Get-Item $exportPath).Name)\"\n    }\n  }\n\n  Write-XY @{ table = @{ title = 'Privileged Accounts Audit'; header = $displayHeaders; rows = $tableRows; caption = $captionText } }\n\n  return [PSCustomObject]@{\n    tool = 'Privileged Accounts'; success = $true\n    totalMemberships = $allMembers.Count; uniqueUsers = $uniqueUsers.Count\n    generatedFiles = $generatedFiles\n  }\n}\n\nfunction Invoke-ServiceAccounts {\n  param($Params)\n\n  $searchBase = (Get-Param $Params 'searchBase' '').Trim()\n\n  Write-XYProgress 0.15 'Querying accounts with Service Principal Names...'\n\n  $adParams = @{\n    Filter     = 'ServicePrincipalNames -like \"*\"'\n    Properties = @('Name', 'SamAccountName', 'Enabled', 'ServicePrincipalNames',\n                   'PasswordLastSet', 'LastLogonDate', 'TrustedForDelegation',\n                   'TrustedToAuthForDelegation', 'Description', 'Created')\n  }\n  if ($searchBase) { $adParams.SearchBase = $searchBase }\n\n  $users = @(Get-ADUser @adParams)\n  Write-XYProgress 0.40 \"Found $($users.Count) user account(s) with SPNs\"\n\n  # Also check computer accounts with custom SPNs (beyond default)\n  Write-XYProgress 0.45 'Checking computer accounts...'\n  $compParams = @{\n    Filter     = 'ServicePrincipalNames -like \"*\"'\n    Properties = @('Name', 'SamAccountName', 'Enabled', 'ServicePrincipalNames',\n                   'PasswordLastSet', 'LastLogonDate', 'TrustedForDelegation',\n                   'TrustedToAuthForDelegation', 'Description', 'Created')\n  }\n  if ($searchBase) { $compParams.SearchBase = $searchBase }\n\n  # Focus on user service accounts (most relevant for Kerberoasting)\n  Write-XYProgress 0.60 'Building output...'\n\n  $displayHeaders = @('#', 'Name', 'Username', 'Enabled', 'SPNs', 'Pwd Last Set', 'Delegation', 'Last Logon')\n  $tableRows = @()\n  $dataRows = @()\n  $idx = 0\n  foreach ($u in ($users | Sort-Object Name)) {\n    $idx++\n    $enabled = Format-ADValue -Value $u.Enabled -PropertyName 'Enabled'\n    $spns = Format-ADValue -Value $u.ServicePrincipalNames -PropertyName 'ServicePrincipalNames'\n    $pwdSet = Format-ADValue -Value $u.PasswordLastSet -PropertyName 'PasswordLastSet'\n    $lastLogon = Format-ADValue -Value $u.LastLogonDate -PropertyName 'LastLogonDate'\n    $delegation = @()\n    if ($u.TrustedForDelegation) { $delegation += 'Unconstrained' }\n    if ($u.TrustedToAuthForDelegation) { $delegation += 'Protocol Transition' }\n    $delegStr = if ($delegation.Count -gt 0) { $delegation -join ', ' } else { 'None' }\n    $tableRows += ,@($idx, $u.Name, $u.SamAccountName, $enabled, $spns, $pwdSet, $delegStr, $lastLogon)\n    $dataRows += ,@($u.Name, $u.SamAccountName, $enabled, $spns, $pwdSet, $delegStr, $lastLogon)\n  }\n\n  $captionText = \"Found $($users.Count) user service account(s) with SPNs\"\n\n  $opts = Get-CommonQueryOpts $Params\n  $generatedFiles = @()\n  if ($opts.ExportEnabled) {\n    $exportHeaders = @('Name', 'Username', 'Enabled', 'SPNs', 'Pwd Last Set', 'Delegation', 'Last Logon')\n    $exportPath = Export-ResultsToFile -Rows $dataRows -Headers $exportHeaders `\n      -Format $opts.ExportFormat -FileName $opts.ExportFileName -Title 'Service Accounts (SPN)'\n    if ($exportPath -and (Test-Path $exportPath)) {\n      $generatedFiles += (Get-Item $exportPath).Name\n      $captionText += \" | Exported: $((Get-Item $exportPath).Name)\"\n    }\n  }\n\n  Write-XY @{ table = @{ title = 'Service Accounts (SPN)'; header = $displayHeaders; rows = $tableRows; caption = $captionText } }\n\n  return [PSCustomObject]@{\n    tool = 'Service Accounts'; success = $true\n    totalResults = $users.Count; generatedFiles = $generatedFiles\n  }\n}\n\nfunction Invoke-DisabledAccounts {\n  param($Params)\n\n  $objectType = (Get-Param $Params 'disabledObjectType' 'users').ToLower()\n  $searchBase = (Get-Param $Params 'searchBase' '').Trim()\n\n  Write-XYProgress 0.15 \"Searching for disabled $objectType...\"\n\n  $allResults = [System.Collections.Generic.List[object]]::new()\n\n  if ($objectType -in @('users', 'both')) {\n    Write-XYProgress 0.25 'Querying disabled user accounts...'\n    $searchParams = @{}\n    if ($searchBase) { $searchParams.SearchBase = $searchBase }\n    $disabledUsers = @(Search-ADAccount -AccountDisabled -UsersOnly @searchParams -ErrorAction Stop)\n    foreach ($d in $disabledUsers) {\n      try {\n        $u = Get-ADUser -Identity $d.SamAccountName -Properties Name, SamAccountName,\n          LastLogonDate, WhenChanged, Description, Created -ErrorAction SilentlyContinue\n        if ($u) {\n          $u | Add-Member -NotePropertyName 'ObjectType' -NotePropertyValue 'User' -Force\n          $allResults.Add($u)\n        }\n      } catch {}\n    }\n  }\n\n  if ($objectType -in @('computers', 'both')) {\n    Write-XYProgress 0.50 'Querying disabled computer accounts...'\n    $searchParams = @{}\n    if ($searchBase) { $searchParams.SearchBase = $searchBase }\n    $disabledComps = @(Search-ADAccount -AccountDisabled -ComputersOnly @searchParams -ErrorAction Stop)\n    foreach ($d in $disabledComps) {\n      try {\n        $c = Get-ADComputer -Identity $d.SamAccountName -Properties Name, SamAccountName,\n          LastLogonDate, WhenChanged, Description, Created, OperatingSystem -ErrorAction SilentlyContinue\n        if ($c) {\n          $c | Add-Member -NotePropertyName 'ObjectType' -NotePropertyValue 'Computer' -Force\n          $allResults.Add($c)\n        }\n      } catch {}\n    }\n  }\n\n  Write-XYProgress 0.70 'Building output...'\n\n  $displayHeaders = @('#', 'Name', 'Username', 'Type', 'Last Logon', 'Last Modified', 'Created', 'Description')\n  $tableRows = @()\n  $dataRows = @()\n  $idx = 0\n  foreach ($item in ($allResults | Sort-Object WhenChanged -Descending)) {\n    $idx++\n    $lastLogon = Format-ADValue -Value $item.LastLogonDate -PropertyName 'LastLogonDate'\n    $modified = Format-ADValue -Value $item.WhenChanged -PropertyName 'WhenChanged'\n    $created = Format-ADValue -Value $item.Created -PropertyName 'Created'\n    $desc = if ($item.Description) { $item.Description } else { '-' }\n    $tableRows += ,@($idx, $item.Name, $item.SamAccountName, $item.ObjectType, $lastLogon, $modified, $created, $desc)\n    $dataRows += ,@($item.Name, $item.SamAccountName, $item.ObjectType, $lastLogon, $modified, $created, $desc)\n  }\n\n  $captionText = \"Found $($allResults.Count) disabled account(s)\"\n\n  $opts = Get-CommonQueryOpts $Params\n  $generatedFiles = @()\n  if ($opts.ExportEnabled) {\n    $exportHeaders = @('Name', 'Username', 'Type', 'Last Logon', 'Last Modified', 'Created', 'Description')\n    $exportPath = Export-ResultsToFile -Rows $dataRows -Headers $exportHeaders `\n      -Format $opts.ExportFormat -FileName $opts.ExportFileName -Title 'Disabled Accounts'\n    if ($exportPath -and (Test-Path $exportPath)) {\n      $generatedFiles += (Get-Item $exportPath).Name\n      $captionText += \" | Exported: $((Get-Item $exportPath).Name)\"\n    }\n  }\n\n  Write-XY @{ table = @{ title = 'Disabled Accounts'; header = $displayHeaders; rows = $tableRows; caption = $captionText } }\n\n  return [PSCustomObject]@{\n    tool = 'Disabled Accounts'; success = $true; objectType = $objectType\n    totalResults = $allResults.Count; generatedFiles = $generatedFiles\n  }\n}\n\nfunction Invoke-PasswordPolicy {\n  param($Params)\n\n  Write-XYProgress 0.15 'Querying default domain password policy...'\n  $defaultPolicy = Get-ADDefaultDomainPasswordPolicy -ErrorAction Stop\n\n  $policyRows = @(\n    @('Min Password Length', $defaultPolicy.MinPasswordLength),\n    @('Password History Count', $defaultPolicy.PasswordHistoryCount),\n    @('Max Password Age', $defaultPolicy.MaxPasswordAge.ToString()),\n    @('Min Password Age', $defaultPolicy.MinPasswordAge.ToString()),\n    @('Complexity Enabled', $(if ($defaultPolicy.ComplexityEnabled) { 'Yes' } else { 'No' })),\n    @('Reversible Encryption', $(if ($defaultPolicy.ReversibleEncryptionEnabled) { 'Yes' } else { 'No' })),\n    @('Lockout Threshold', $defaultPolicy.LockoutThreshold),\n    @('Lockout Duration', $defaultPolicy.LockoutDuration.ToString()),\n    @('Lockout Observation Window', $defaultPolicy.LockoutObservationWindow.ToString())\n  )\n\n  Write-XY @{ table = @{\n    title = 'Default Domain Password Policy'\n    header = @('Setting', 'Value')\n    rows = $policyRows\n    caption = 'Default policy applied to all users unless overridden by FGPP'\n  } }\n\n  # Fine-grained password policies\n  Write-XYProgress 0.50 'Querying fine-grained password policies...'\n  $fgpps = @()\n  try {\n    $fgpps = @(Get-ADFineGrainedPasswordPolicy -Filter * -Properties * -ErrorAction SilentlyContinue)\n  } catch {}\n\n  Write-XYProgress 0.70 'Building output...'\n\n  if ($fgpps.Count -gt 0) {\n    $fgppHeaders = @('#', 'Name', 'Precedence', 'Min Length', 'Max Age', 'Complexity', 'Lockout Threshold', 'Applies To')\n    $fgppRows = @()\n    $dataRows = @()\n    $idx = 0\n    foreach ($f in ($fgpps | Sort-Object Precedence)) {\n      $idx++\n      $complexity = if ($f.ComplexityEnabled) { 'Yes' } else { 'No' }\n      $appliesTo = '-'\n      if ($f.AppliesTo) {\n        $subjects = @($f.AppliesTo | ForEach-Object {\n          if ($_ -match 'CN=([^,]+)') { $Matches[1] } else { $_ }\n        })\n        $appliesTo = Format-ADValue -Value $subjects -PropertyName 'AppliesTo'\n      }\n      $fgppRows += ,@($idx, $f.Name, $f.Precedence, $f.MinPasswordLength, $f.MaxPasswordAge.ToString(), $complexity, $f.LockoutThreshold, $appliesTo)\n      $dataRows += ,@($f.Name, $f.Precedence, $f.MinPasswordLength, $f.MaxPasswordAge.ToString(), $complexity, $f.LockoutThreshold, $appliesTo)\n    }\n\n    $captionText = \"$($fgpps.Count) fine-grained password policy(ies) found\"\n\n    $opts = Get-CommonQueryOpts $Params\n    $generatedFiles = @()\n    if ($opts.ExportEnabled) {\n      $exportHeaders = @('Name', 'Precedence', 'Min Length', 'Max Age', 'Complexity', 'Lockout Threshold', 'Applies To')\n      $exportPath = Export-ResultsToFile -Rows $dataRows -Headers $exportHeaders `\n        -Format $opts.ExportFormat -FileName $opts.ExportFileName -Title 'Password Policies'\n      if ($exportPath -and (Test-Path $exportPath)) {\n        $generatedFiles += (Get-Item $exportPath).Name\n        $captionText += \" | Exported: $((Get-Item $exportPath).Name)\"\n      }\n    }\n\n    Write-XY @{ table = @{ title = 'Fine-Grained Password Policies'; header = $fgppHeaders; rows = $fgppRows; caption = $captionText } }\n  } else {\n    Write-XY @{ table = @{\n      title = 'Fine-Grained Password Policies'\n      header = @('#', 'Info')\n      rows = @(,@(1, 'No fine-grained password policies configured.'))\n      caption = ''\n    } }\n    $generatedFiles = @()\n  }\n\n  return [PSCustomObject]@{\n    tool = 'Password Policy'; success = $true\n    fgppCount = $fgpps.Count; generatedFiles = $generatedFiles\n  }\n}\n\n#endregion\n\n#region AD Query Functions — v3.0 Infrastructure Tools\n\nfunction Invoke-ReplicationStatus {\n  param($Params)\n\n  Write-XYProgress 0.15 'Querying AD replication status...'\n\n  $replData = @()\n  try {\n    $replData = @(Get-ADReplicationPartnerMetadata -Target * -Scope Domain -ErrorAction Stop)\n  } catch {\n    # Fallback: try per-DC\n    Write-XYProgress 0.20 'Querying per domain controller...'\n    $dcs = @(Get-ADDomainController -Filter * -ErrorAction Stop)\n    foreach ($dc in $dcs) {\n      try {\n        $replData += @(Get-ADReplicationPartnerMetadata -Target $dc.HostName -ErrorAction SilentlyContinue)\n      } catch {}\n    }\n  }\n\n  Write-XYProgress 0.60 \"Retrieved $($replData.Count) replication partnership(s)\"\n\n  $displayHeaders = @('#', 'Server', 'Partner', 'Partition', 'Last Replication', 'Result', 'Failures')\n  $tableRows = @()\n  $dataRows = @()\n  $idx = 0\n  $failureCount = 0\n  foreach ($r in ($replData | Sort-Object Server, Partner)) {\n    $idx++\n    $server = if ($r.Server) { ($r.Server -split '\\.')[0] } else { '-' }\n    $partner = if ($r.Partner) {\n      $partnerStr = [string]$r.Partner\n      if ($partnerStr -match 'CN=NTDS Settings,CN=([^,]+)') { $Matches[1] } else { ($partnerStr -split '\\.')[0] }\n    } else { '-' }\n    $partition = if ($r.Partition) {\n      $p = [string]$r.Partition\n      if ($p -match 'DC=') { ($p -split ',DC=' | Select-Object -First 1) -replace 'DC=', '' }\n      else { $p.Substring(0, [Math]::Min(30, $p.Length)) }\n    } else { '-' }\n    $lastRepl = Format-ADValue -Value $r.LastReplicationSuccess -PropertyName 'LastReplicationSuccess'\n    $resultCode = if ($r.LastReplicationResult -eq 0) { 'Success' } else { \"Error: $($r.LastReplicationResult)\" }\n    $failures = if ($null -ne $r.ConsecutiveReplicationFailures) { $r.ConsecutiveReplicationFailures } else { 0 }\n    if ($failures -gt 0) { $failureCount++ }\n    $tableRows += ,@($idx, $server, $partner, $partition, $lastRepl, $resultCode, $failures)\n    $dataRows += ,@($server, $partner, $partition, $lastRepl, $resultCode, $failures)\n  }\n\n  $healthStatus = if ($failureCount -eq 0) { 'HEALTHY' } else { \"WARNING: $failureCount partnership(s) with failures\" }\n  $captionText = \"$($replData.Count) replication partnership(s) | Status: $healthStatus\"\n\n  $opts = Get-CommonQueryOpts $Params\n  $generatedFiles = @()\n  if ($opts.ExportEnabled) {\n    $exportHeaders = @('Server', 'Partner', 'Partition', 'Last Replication', 'Result', 'Failures')\n    $exportPath = Export-ResultsToFile -Rows $dataRows -Headers $exportHeaders `\n      -Format $opts.ExportFormat -FileName $opts.ExportFileName -Title 'AD Replication Status'\n    if ($exportPath -and (Test-Path $exportPath)) {\n      $generatedFiles += (Get-Item $exportPath).Name\n      $captionText += \" | Exported: $((Get-Item $exportPath).Name)\"\n    }\n  }\n\n  Write-XY @{ table = @{ title = 'AD Replication Status'; header = $displayHeaders; rows = $tableRows; caption = $captionText } }\n\n  return [PSCustomObject]@{\n    tool = 'Replication Status'; success = $true\n    totalPartnerships = $replData.Count; failureCount = $failureCount\n    generatedFiles = $generatedFiles\n  }\n}\n\nfunction Invoke-SitesAndSubnets {\n  param($Params)\n\n  Write-XYProgress 0.15 'Querying AD sites...'\n  $sites = @(Get-ADReplicationSite -Filter * -Properties Name, Description, Location, Created -ErrorAction Stop)\n  Write-XYProgress 0.35 \"Found $($sites.Count) site(s)\"\n\n  Write-XYProgress 0.40 'Querying subnets...'\n  $subnets = @(Get-ADReplicationSubnet -Filter * -Properties Name, Site, Location, Description -ErrorAction Stop)\n  Write-XYProgress 0.55 \"Found $($subnets.Count) subnet(s)\"\n\n  Write-XYProgress 0.60 'Querying site links...'\n  $siteLinks = @(Get-ADReplicationSiteLink -Filter * -Properties Name, Cost, ReplicationFrequencyInMinutes, SitesIncluded -ErrorAction Stop)\n\n  Write-XYProgress 0.70 'Building output...'\n\n  # Sites table\n  $displayHeaders = @('#', 'Site Name', 'Location', 'Subnets', 'Site Links', 'Description')\n  $tableRows = @()\n  $dataRows = @()\n  $idx = 0\n  foreach ($s in ($sites | Sort-Object Name)) {\n    $idx++\n    $location = if ($s.Location) { $s.Location } else { '-' }\n    $desc = if ($s.Description) { $s.Description } else { '-' }\n\n    # Find subnets for this site\n    $siteSubnets = @($subnets | Where-Object {\n      $siteDN = [string]$_.Site\n      $siteDN -match \"CN=$([regex]::Escape($s.Name)),\"\n    })\n    $subnetStr = if ($siteSubnets.Count -gt 0) {\n      Format-ADValue -Value @($siteSubnets | ForEach-Object { $_.Name }) -PropertyName 'Subnets'\n    } else { '-' }\n\n    # Find site links for this site\n    $relatedLinks = @($siteLinks | Where-Object {\n      $_.SitesIncluded | Where-Object { $_ -match \"CN=$([regex]::Escape($s.Name)),\" }\n    })\n    $linkStr = if ($relatedLinks.Count -gt 0) {\n      Format-ADValue -Value @($relatedLinks | ForEach-Object { \"$($_.Name) (cost:$($_.Cost))\" }) -PropertyName 'Links'\n    } else { '-' }\n\n    $tableRows += ,@($idx, $s.Name, $location, $subnetStr, $linkStr, $desc)\n    $dataRows += ,@($s.Name, $location, $subnetStr, $linkStr, $desc)\n  }\n\n  $captionText = \"$($sites.Count) site(s) | $($subnets.Count) subnet(s) | $($siteLinks.Count) site link(s)\"\n\n  $opts = Get-CommonQueryOpts $Params\n  $generatedFiles = @()\n  if ($opts.ExportEnabled) {\n    $exportHeaders = @('Site Name', 'Location', 'Subnets', 'Site Links', 'Description')\n    $exportPath = Export-ResultsToFile -Rows $dataRows -Headers $exportHeaders `\n      -Format $opts.ExportFormat -FileName $opts.ExportFileName -Title 'AD Sites and Subnets'\n    if ($exportPath -and (Test-Path $exportPath)) {\n      $generatedFiles += (Get-Item $exportPath).Name\n      $captionText += \" | Exported: $((Get-Item $exportPath).Name)\"\n    }\n  }\n\n  Write-XY @{ table = @{ title = 'AD Sites and Subnets'; header = $displayHeaders; rows = $tableRows; caption = $captionText } }\n\n  return [PSCustomObject]@{\n    tool = 'Sites & Subnets'; success = $true\n    totalSites = $sites.Count; totalSubnets = $subnets.Count; totalSiteLinks = $siteLinks.Count\n    generatedFiles = $generatedFiles\n  }\n}\n\nfunction Invoke-TrustRelationships {\n  param($Params)\n\n  Write-XYProgress 0.20 'Querying domain trust relationships...'\n\n  $trusts = @(Get-ADTrust -Filter * -Properties * -ErrorAction Stop)\n  Write-XYProgress 0.60 \"Found $($trusts.Count) trust(s)\"\n\n  if ($trusts.Count -eq 0) {\n    Write-XY @{ table = @{\n      title = 'Trust Relationships'\n      header = @('#', 'Info')\n      rows = @(,@(1, 'No trust relationships found.'))\n      caption = ''\n    } }\n    return [PSCustomObject]@{ tool = 'Trust Relationships'; success = $true; totalResults = 0; generatedFiles = @() }\n  }\n\n  $displayHeaders = @('#', 'Trust Name', 'Direction', 'Trust Type', 'Transitive', 'Forest Trust', 'Selective Auth', 'Created')\n  $tableRows = @()\n  $dataRows = @()\n  $idx = 0\n  foreach ($t in ($trusts | Sort-Object Name)) {\n    $idx++\n    $directionMap = @{ '1' = 'Inbound'; '2' = 'Outbound'; '3' = 'BiDirectional' }\n    $direction = if ($directionMap.ContainsKey([string][int]$t.Direction)) { $directionMap[[string][int]$t.Direction] } else { [string]$t.Direction }\n    $typeMap = @{ '1' = 'Downlevel'; '2' = 'Uplevel'; '3' = 'MIT'; '4' = 'DCE' }\n    $trustType = if ($typeMap.ContainsKey([string][int]$t.TrustType)) { $typeMap[[string][int]$t.TrustType] } else { [string]$t.TrustType }\n    $transitive = if ($t.IsTreeParent -or $t.IsTreeChild) { 'Yes (Tree)' }\n                  elseif ($t.PSObject.Properties.Name -contains 'TrustAttributes' -and ($t.TrustAttributes -band 1)) { 'Non-Transitive' }\n                  else { 'Transitive' }\n    $forestTrust = if ($t.ForestTransitive) { 'Yes' } else { 'No' }\n    $selectiveAuth = if ($t.SelectiveAuthentication) { 'Yes' } else { 'No' }\n    $created = Format-ADValue -Value $t.Created -PropertyName 'Created'\n    $tableRows += ,@($idx, $t.Name, $direction, $trustType, $transitive, $forestTrust, $selectiveAuth, $created)\n    $dataRows += ,@($t.Name, $direction, $trustType, $transitive, $forestTrust, $selectiveAuth, $created)\n  }\n\n  $captionText = \"$($trusts.Count) trust relationship(s)\"\n\n  $opts = Get-CommonQueryOpts $Params\n  $generatedFiles = @()\n  if ($opts.ExportEnabled) {\n    $exportHeaders = @('Trust Name', 'Direction', 'Trust Type', 'Transitive', 'Forest Trust', 'Selective Auth', 'Created')\n    $exportPath = Export-ResultsToFile -Rows $dataRows -Headers $exportHeaders `\n      -Format $opts.ExportFormat -FileName $opts.ExportFileName -Title 'Trust Relationships'\n    if ($exportPath -and (Test-Path $exportPath)) {\n      $generatedFiles += (Get-Item $exportPath).Name\n      $captionText += \" | Exported: $((Get-Item $exportPath).Name)\"\n    }\n  }\n\n  Write-XY @{ table = @{ title = 'Trust Relationships'; header = $displayHeaders; rows = $tableRows; caption = $captionText } }\n\n  return [PSCustomObject]@{\n    tool = 'Trust Relationships'; success = $true\n    totalResults = $trusts.Count; generatedFiles = $generatedFiles\n  }\n}\n\nfunction Invoke-GPOOverview {\n  param($Params)\n\n  Assert-GroupPolicyModule\n\n  Write-XYProgress 0.15 'Querying Group Policy Objects...'\n  $gpos = @(Get-GPO -All -ErrorAction Stop)\n  Write-XYProgress 0.40 \"Found $($gpos.Count) GPO(s)\"\n\n  Write-XYProgress 0.45 'Gathering link information...'\n\n  $displayHeaders = @('#', 'Display Name', 'Status', 'Created', 'Modified', 'Computer Ver.', 'User Ver.', 'Links')\n  $tableRows = @()\n  $dataRows = @()\n  $idx = 0\n  $gpoTotal = $gpos.Count\n  foreach ($g in ($gpos | Sort-Object DisplayName)) {\n    $idx++\n    if ($idx % 10 -eq 0) {\n      $pct = 0.45 + (0.25 * $idx / $gpoTotal)\n      Write-XYProgress $pct \"Processing GPO $idx of $gpoTotal...\"\n    }\n\n    $statusMap = @{\n      'AllSettingsDisabled' = 'All Disabled'\n      'AllSettingsEnabled'  = 'Enabled'\n      'UserSettingsDisabled' = 'User Disabled'\n      'ComputerSettingsDisabled' = 'Computer Disabled'\n    }\n    $status = if ($statusMap.ContainsKey([string]$g.GpoStatus)) { $statusMap[[string]$g.GpoStatus] } else { [string]$g.GpoStatus }\n    $created = Format-ADValue -Value $g.CreationTime -PropertyName 'CreationTime'\n    $modified = Format-ADValue -Value $g.ModificationTime -PropertyName 'ModificationTime'\n    $compVer = try { \"$($g.Computer.DSVersion)/$($g.Computer.SysvolVersion)\" } catch { '-' }\n    $userVer = try { \"$($g.User.DSVersion)/$($g.User.SysvolVersion)\" } catch { '-' }\n\n    # Get links via GPO report\n    $links = '-'\n    try {\n      $xmlReport = [xml](Get-GPOReport -Guid $g.Id -ReportType Xml -ErrorAction SilentlyContinue)\n      $linkNodes = $xmlReport.GPO.LinksTo\n      if ($linkNodes) {\n        $linkNames = @($linkNodes | ForEach-Object { $_.SOMPath })\n        $links = Format-ADValue -Value $linkNames -PropertyName 'Links'\n      }\n    } catch {}\n\n    $tableRows += ,@($idx, $g.DisplayName, $status, $created, $modified, $compVer, $userVer, $links)\n    $dataRows += ,@($g.DisplayName, $status, $created, $modified, $compVer, $userVer, $links)\n  }\n\n  $captionText = \"$($gpos.Count) Group Policy Object(s)\"\n\n  $opts = Get-CommonQueryOpts $Params\n  $generatedFiles = @()\n  if ($opts.ExportEnabled) {\n    $exportHeaders = @('Display Name', 'Status', 'Created', 'Modified', 'Computer Ver.', 'User Ver.', 'Links')\n    $exportPath = Export-ResultsToFile -Rows $dataRows -Headers $exportHeaders `\n      -Format $opts.ExportFormat -FileName $opts.ExportFileName -Title 'GPO Overview'\n    if ($exportPath -and (Test-Path $exportPath)) {\n      $generatedFiles += (Get-Item $exportPath).Name\n      $captionText += \" | Exported: $((Get-Item $exportPath).Name)\"\n    }\n  }\n\n  Write-XY @{ table = @{ title = 'Group Policy Objects'; header = $displayHeaders; rows = $tableRows; caption = $captionText } }\n\n  return [PSCustomObject]@{\n    tool = 'GPO Overview'; success = $true\n    totalResults = $gpos.Count; generatedFiles = $generatedFiles\n  }\n}\n\n#endregion\n\n#region AD Query Functions — v3.0 Operational Tools\n\nfunction Invoke-UserDetail {\n  param($Params)\n\n  $targetUser = (Get-Param $Params 'targetUser' '').Trim()\n  if (-not $targetUser) { throw 'No target user specified. Provide a SamAccountName or Distinguished Name.' }\n\n  Write-XYProgress 0.15 \"Looking up user '$targetUser'...\"\n  $user = Get-ADUser -Identity $targetUser -Properties * -ErrorAction Stop\n  Write-XYProgress 0.35 \"Found user: $($user.Name)\"\n\n  # Identity section\n  $identityRows = @(\n    @('Display Name', $(if ($user.DisplayName) { $user.DisplayName } else { '-' })),\n    @('Username', $user.SamAccountName),\n    @('UPN', $(if ($user.UserPrincipalName) { $user.UserPrincipalName } else { '-' })),\n    @('SID', $user.SID.ToString()),\n    @('Distinguished Name', $user.DistinguishedName),\n    @('Object GUID', $user.ObjectGUID.ToString())\n  )\n\n  # Organization section\n  $orgRows = @(\n    @('Title', $(if ($user.Title) { $user.Title } else { '-' })),\n    @('Department', $(if ($user.Department) { $user.Department } else { '-' })),\n    @('Company', $(if ($user.Company) { $user.Company } else { '-' })),\n    @('Office', $(if ($user.Office) { $user.Office } else { '-' })),\n    @('Manager', $(Format-ADValue -Value $user.Manager -PropertyName 'Manager')),\n    @('Phone', $(if ($user.TelephoneNumber) { $user.TelephoneNumber } else { '-' })),\n    @('Email', $(if ($user.EmailAddress) { $user.EmailAddress } else { '-' }))\n  )\n\n  # Account status section\n  $accountRows = @(\n    @('Enabled', $(Format-ADValue -Value $user.Enabled -PropertyName 'Enabled')),\n    @('Locked Out', $(Format-ADValue -Value $user.LockedOut -PropertyName 'LockedOut')),\n    @('Created', $(Format-ADValue -Value $user.Created -PropertyName 'Created')),\n    @('Last Modified', $(Format-ADValue -Value $user.WhenChanged -PropertyName 'WhenChanged')),\n    @('Last Logon', $(Format-ADValue -Value $user.LastLogonDate -PropertyName 'LastLogonDate')),\n    @('Logon Count', $(if ($null -ne $user.logonCount) { $user.logonCount } else { '-' })),\n    @('Bad Pwd Count', $(if ($null -ne $user.BadLogonCount) { $user.BadLogonCount } else { '-' })),\n    @('Password Last Set', $(Format-ADValue -Value $user.PasswordLastSet -PropertyName 'PasswordLastSet')),\n    @('Password Never Expires', $(Format-ADValue -Value $user.PasswordNeverExpires -PropertyName 'PasswordNeverExpires')),\n    @('Password Expired', $(Format-ADValue -Value $user.PasswordExpired -PropertyName 'PasswordExpired')),\n    @('Account Expires', $(Format-ADValue -Value $user.AccountExpirationDate -PropertyName 'AccountExpirationDate')),\n    @('Description', $(if ($user.Description) { $user.Description } else { '-' }))\n  )\n\n  # Emit identity table\n  Write-XY @{ table = @{ title = \"User Detail — $($user.Name) (Identity)\"; header = @('Property', 'Value'); rows = $identityRows; caption = '' } }\n  Write-XY @{ table = @{ title = \"User Detail — $($user.Name) (Organization)\"; header = @('Property', 'Value'); rows = $orgRows; caption = '' } }\n\n  # Group memberships\n  Write-XYProgress 0.60 'Retrieving group memberships...'\n  $groups = @()\n  try { $groups = @(Get-ADPrincipalGroupMembership -Identity $user -ErrorAction SilentlyContinue) } catch {}\n  $groupNames = @($groups | ForEach-Object { $_.Name } | Sort-Object)\n  $groupStr = if ($groupNames.Count -gt 0) { $groupNames -join ', ' } else { 'None' }\n  $accountRows += @(,@('Group Memberships', \"$($groupNames.Count) group(s): $groupStr\"))\n\n  # Direct reports\n  Write-XYProgress 0.70 'Checking direct reports...'\n  $directReports = @()\n  try { $directReports = @(Get-ADUser -Filter \"Manager -eq '$($user.DistinguishedName)'\" -Properties Name -ErrorAction SilentlyContinue) } catch {}\n  $reportsStr = if ($directReports.Count -gt 0) {\n    $reportNames = @($directReports | ForEach-Object { $_.Name } | Sort-Object)\n    Format-ADValue -Value $reportNames -PropertyName 'DirectReports'\n  } else { 'None' }\n  $accountRows += @(,@('Direct Reports', \"$($directReports.Count): $reportsStr\"))\n\n  $captionText = \"$($groupNames.Count) group(s) | $($directReports.Count) direct report(s)\"\n\n  # Export all sections combined\n  $opts = Get-CommonQueryOpts $Params\n  $generatedFiles = @()\n  $allDataRows = @()\n  $allDataRows += @(,@('--- Identity ---', ''))\n  $allDataRows += $identityRows\n  $allDataRows += @(,@('--- Organization ---', ''))\n  $allDataRows += $orgRows\n  $allDataRows += @(,@('--- Account Status ---', ''))\n  $allDataRows += $accountRows\n\n  if ($opts.ExportEnabled) {\n    $exportHeaders = @('Property', 'Value')\n    $exportPath = Export-ResultsToFile -Rows $allDataRows -Headers $exportHeaders `\n      -Format $opts.ExportFormat -FileName $opts.ExportFileName -Title \"User Detail - $($user.SamAccountName)\"\n    if ($exportPath -and (Test-Path $exportPath)) {\n      $generatedFiles += (Get-Item $exportPath).Name\n      $captionText += \" | Exported: $((Get-Item $exportPath).Name)\"\n    }\n  }\n\n  # Account status is the last table (shown in gridview)\n  Write-XY @{ table = @{ title = \"User Detail — $($user.Name) (Account)\"; header = @('Property', 'Value'); rows = $accountRows; caption = $captionText } }\n\n  return [PSCustomObject]@{\n    tool = 'User Detail'; success = $true; targetUser = $user.SamAccountName\n    groupCount = $groupNames.Count; groups = $groupNames\n    directReports = $directReports.Count\n    generatedFiles = $generatedFiles\n  }\n}\n\nfunction Invoke-RecentChanges {\n  param($Params)\n\n  $changeDaysStr = (Get-Param $Params 'changeDays' '7').ToString().Trim()\n  $changeDays = 7\n  if ($changeDaysStr -match '^\\d+$') { $changeDays = [int]$changeDaysStr }\n  $changeDays = [Math]::Max(1, $changeDays)\n\n  $changeType = (Get-Param $Params 'changeType' 'both').ToLower()\n  $objectType = (Get-Param $Params 'changeObjectType' 'all').ToLower()\n  $searchBase = (Get-Param $Params 'searchBase' '').Trim()\n  $maxResultsStr = (Get-Param $Params 'maxResults' '500').ToString().Trim()\n  $maxResults = 500\n  if ($maxResultsStr -match '^\\d+$') { $maxResults = [int]$maxResultsStr }\n  $maxResults = [Math]::Min(10000, [Math]::Max(1, $maxResults))\n\n  $cutoff = (Get-Date).AddDays(-$changeDays).ToString('yyyy-MM-ddTHH:mm:ss')\n\n  Write-XYProgress 0.15 \"Finding objects changed in the last $changeDays day(s)...\"\n\n  $filters = @()\n  if ($changeType -eq 'created') {\n    $filters += \"WhenCreated -ge '$cutoff'\"\n  } elseif ($changeType -eq 'modified') {\n    $filters += \"WhenChanged -ge '$cutoff'\"\n  } else {\n    # both: modified is superset of created\n    $filters += \"WhenChanged -ge '$cutoff'\"\n  }\n\n  # Object class filter\n  $classFilter = switch ($objectType) {\n    'users'     { \"objectClass -eq 'user'\" }\n    'groups'    { \"objectClass -eq 'group'\" }\n    'computers' { \"objectClass -eq 'computer'\" }\n    default     { $null }\n  }\n  if ($classFilter) { $filters += $classFilter }\n\n  $filterStr = $filters -join ' -and '\n\n  $adParams = @{\n    Filter        = $filterStr\n    Properties    = @('Name', 'ObjectClass', 'WhenCreated', 'WhenChanged', 'Description', 'DistinguishedName')\n    ResultSetSize = $maxResults\n  }\n  if ($searchBase) { $adParams.SearchBase = $searchBase }\n\n  $results = @(Get-ADObject @adParams)\n  Write-XYProgress 0.55 \"Found $($results.Count) object(s)\"\n\n  # Determine if each was created or modified within the window\n  $cutoffDate = (Get-Date).AddDays(-$changeDays)\n\n  Write-XYProgress 0.65 'Building output...'\n\n  $displayHeaders = @('#', 'Name', 'Type', 'Action', 'When Created', 'When Modified', 'Description')\n  $tableRows = @()\n  $dataRows = @()\n  $idx = 0\n  foreach ($item in ($results | Sort-Object WhenChanged -Descending)) {\n    $idx++\n    $action = if ($item.WhenCreated -ge $cutoffDate) { 'Created' } else { 'Modified' }\n    $created = Format-ADValue -Value $item.WhenCreated -PropertyName 'WhenCreated'\n    $modified = Format-ADValue -Value $item.WhenChanged -PropertyName 'WhenChanged'\n    $desc = if ($item.Description) { $item.Description } else { '-' }\n    $objClass = (Get-Culture).TextInfo.ToTitleCase([string]$item.ObjectClass)\n    $tableRows += ,@($idx, $item.Name, $objClass, $action, $created, $modified, $desc)\n    $dataRows += ,@($item.Name, $objClass, $action, $created, $modified, $desc)\n  }\n\n  $captionText = \"$($results.Count) object(s) changed in the last $changeDays day(s)\"\n\n  $opts = Get-CommonQueryOpts $Params\n  $generatedFiles = @()\n  if ($opts.ExportEnabled) {\n    $exportHeaders = @('Name', 'Type', 'Action', 'When Created', 'When Modified', 'Description')\n    $exportPath = Export-ResultsToFile -Rows $dataRows -Headers $exportHeaders `\n      -Format $opts.ExportFormat -FileName $opts.ExportFileName -Title \"Recent AD Changes ($changeDays days)\"\n    if ($exportPath -and (Test-Path $exportPath)) {\n      $generatedFiles += (Get-Item $exportPath).Name\n      $captionText += \" | Exported: $((Get-Item $exportPath).Name)\"\n    }\n  }\n\n  Write-XY @{ table = @{ title = \"Recent AD Changes ($changeDays Days)\"; header = $displayHeaders; rows = $tableRows; caption = $captionText } }\n\n  return [PSCustomObject]@{\n    tool = 'Recent Changes'; success = $true; changeDays = $changeDays\n    changeType = $changeType; objectType = $objectType\n    totalResults = $results.Count; generatedFiles = $generatedFiles\n  }\n}\n\nfunction Invoke-AccountExpiration {\n  param($Params)\n\n  $expiryDaysStr = (Get-Param $Params 'accountExpiryDays' '30').ToString().Trim()\n  $expiryDays = 30\n  if ($expiryDaysStr -match '^\\d+$') { $expiryDays = [int]$expiryDaysStr }\n  $expiryDays = [Math]::Max(1, $expiryDays)\n\n  $searchBase = (Get-Param $Params 'searchBase' '').Trim()\n\n  Write-XYProgress 0.20 \"Finding accounts expiring within $expiryDays days...\"\n\n  $searchParams = @{}\n  if ($searchBase) { $searchParams.SearchBase = $searchBase }\n\n  $expiring = @(Search-ADAccount -AccountExpiring -TimeSpan (New-TimeSpan -Days $expiryDays) -UsersOnly @searchParams -ErrorAction Stop)\n  Write-XYProgress 0.50 \"Found $($expiring.Count) expiring account(s)\"\n\n  # Get details\n  $detailed = [System.Collections.Generic.List[object]]::new()\n  foreach ($e in $expiring) {\n    try {\n      $u = Get-ADUser -Identity $e.SamAccountName -Properties Name, SamAccountName, Enabled,\n        AccountExpirationDate, Department, Title, LastLogonDate, EmailAddress -ErrorAction SilentlyContinue\n      if ($u) { $detailed.Add($u) }\n    } catch {}\n  }\n\n  Write-XYProgress 0.70 'Building output...'\n\n  $now = Get-Date\n  $displayHeaders = @('#', 'Name', 'Username', 'Email', 'Department', 'Expires', 'Days Left', 'Enabled')\n  $tableRows = @()\n  $dataRows = @()\n  $idx = 0\n  foreach ($u in ($detailed | Sort-Object AccountExpirationDate)) {\n    $idx++\n    $email = if ($u.EmailAddress) { $u.EmailAddress } else { '-' }\n    $dept = if ($u.Department) { $u.Department } else { '-' }\n    $expires = Format-ADValue -Value $u.AccountExpirationDate -PropertyName 'AccountExpirationDate'\n    $daysLeft = if ($u.AccountExpirationDate) {\n      $d = [Math]::Floor(($u.AccountExpirationDate - $now).TotalDays)\n      if ($d -lt 0) { \"EXPIRED ($($d)d)\" } elseif ($d -eq 0) { 'TODAY' } else { \"$($d)d\" }\n    } else { '-' }\n    $enabled = Format-ADValue -Value $u.Enabled -PropertyName 'Enabled'\n    $tableRows += ,@($idx, $u.Name, $u.SamAccountName, $email, $dept, $expires, $daysLeft, $enabled)\n    $dataRows += ,@($u.Name, $u.SamAccountName, $email, $dept, $expires, $daysLeft, $enabled)\n  }\n\n  $captionText = \"$($detailed.Count) account(s) expiring within $expiryDays day(s)\"\n\n  $opts = Get-CommonQueryOpts $Params\n  $generatedFiles = @()\n  if ($opts.ExportEnabled) {\n    $exportHeaders = @('Name', 'Username', 'Email', 'Department', 'Expires', 'Days Left', 'Enabled')\n    $exportPath = Export-ResultsToFile -Rows $dataRows -Headers $exportHeaders `\n      -Format $opts.ExportFormat -FileName $opts.ExportFileName -Title \"Account Expiration ($expiryDays days)\"\n    if ($exportPath -and (Test-Path $exportPath)) {\n      $generatedFiles += (Get-Item $exportPath).Name\n      $captionText += \" | Exported: $((Get-Item $exportPath).Name)\"\n    }\n  }\n\n  Write-XY @{ table = @{ title = \"Account Expiration ($expiryDays Days)\"; header = $displayHeaders; rows = $tableRows; caption = $captionText } }\n\n  return [PSCustomObject]@{\n    tool = 'Account Expiration'; success = $true; expiryDays = $expiryDays\n    totalResults = $detailed.Count; generatedFiles = $generatedFiles\n  }\n}\n\nfunction Invoke-DuplicateSPNs {\n  param($Params)\n\n  Write-XYProgress 0.15 'Scanning all accounts for Service Principal Names...'\n\n  # Get all objects with SPNs\n  $allWithSPN = @(Get-ADObject -LDAPFilter '(servicePrincipalName=*)' `\n    -Properties Name, SamAccountName, ServicePrincipalName, ObjectClass -ErrorAction Stop)\n  Write-XYProgress 0.40 \"Found $($allWithSPN.Count) object(s) with SPNs\"\n\n  # Build SPN -> account mapping\n  Write-XYProgress 0.50 'Analyzing for duplicates...'\n  $spnMap = @{}\n  foreach ($obj in $allWithSPN) {\n    $accountName = if ($obj.SamAccountName) { $obj.SamAccountName } else { $obj.Name }\n    foreach ($spn in @($obj.ServicePrincipalName)) {\n      $spnLower = [string]$spn.ToLower()\n      if (-not $spnMap.ContainsKey($spnLower)) {\n        $spnMap[$spnLower] = [System.Collections.Generic.List[string]]::new()\n      }\n      $spnMap[$spnLower].Add(\"$accountName ($($obj.ObjectClass))\")\n    }\n  }\n\n  # Filter for duplicates\n  $duplicates = @($spnMap.GetEnumerator() | Where-Object { $_.Value.Count -gt 1 })\n  Write-XYProgress 0.70 \"Found $($duplicates.Count) duplicate SPN(s)\"\n\n  $displayHeaders = @('#', 'SPN', 'Registered On', 'Count')\n  $tableRows = @()\n  $dataRows = @()\n  $idx = 0\n  foreach ($d in ($duplicates | Sort-Object { $_.Key })) {\n    $idx++\n    $accounts = $d.Value -join '; '\n    $tableRows += ,@($idx, $d.Key, $accounts, $d.Value.Count)\n    $dataRows += ,@($d.Key, $accounts, $d.Value.Count)\n  }\n\n  $totalSPNs = ($spnMap.Keys).Count\n  $healthStatus = if ($duplicates.Count -eq 0) { 'HEALTHY — No duplicates found' } else { \"WARNING — $($duplicates.Count) duplicate(s) detected\" }\n  $captionText = \"$totalSPNs unique SPN(s) scanned | $healthStatus\"\n\n  if ($duplicates.Count -eq 0) {\n    $tableRows = @(,@(1, 'No duplicate SPNs found', '-', 0))\n  }\n\n  $opts = Get-CommonQueryOpts $Params\n  $generatedFiles = @()\n  if ($opts.ExportEnabled) {\n    $exportHeaders = @('SPN', 'Registered On', 'Count')\n    $exportPath = Export-ResultsToFile -Rows $dataRows -Headers $exportHeaders `\n      -Format $opts.ExportFormat -FileName $opts.ExportFileName -Title 'Duplicate SPNs'\n    if ($exportPath -and (Test-Path $exportPath)) {\n      $generatedFiles += (Get-Item $exportPath).Name\n      $captionText += \" | Exported: $((Get-Item $exportPath).Name)\"\n    }\n  }\n\n  Write-XY @{ table = @{ title = 'Duplicate SPN Analysis'; header = $displayHeaders; rows = $tableRows; caption = $captionText } }\n\n  return [PSCustomObject]@{\n    tool = 'Duplicate SPNs'; success = $true\n    totalSPNs = $totalSPNs; duplicateCount = $duplicates.Count\n    generatedFiles = $generatedFiles\n  }\n}\n\n#endregion\n\n#region Export Functions\n\nfunction Export-ResultsToFile {\n  param(\n    [array]$Rows,\n    [array]$Headers,\n    [string]$Format,\n    [string]$FileName,\n    [string]$Title\n  )\n\n  $extensionMap = @{ 'csv' = '.csv'; 'markdown' = '.md'; 'html' = '.html'; 'xlsx' = '.xlsx' }\n  $extension = if ($extensionMap.ContainsKey($Format)) { $extensionMap[$Format] } else { '.csv' }\n\n  $cleanName = $FileName -replace '\\.(csv|md|html|xlsx)$', ''\n  $fileName = \"$cleanName$extension\"\n  $outputPath = Join-Path (Get-Location).Path $fileName\n\n  switch ($Format) {\n    'csv'      { Export-ToCsv -Rows $Rows -Headers $Headers -OutputPath $outputPath }\n    'markdown' { Export-ToMarkdown -Rows $Rows -Headers $Headers -OutputPath $outputPath -Title $Title }\n    'html'     { Export-ToHtml -Rows $Rows -Headers $Headers -OutputPath $outputPath -Title $Title }\n    'xlsx'     { Export-ToXlsx -Rows $Rows -Headers $Headers -OutputPath $outputPath -Title $Title }\n    default    { Export-ToCsv -Rows $Rows -Headers $Headers -OutputPath $outputPath }\n  }\n\n  return $outputPath\n}\n\nfunction Export-ToCsv {\n  param([array]$Rows, [array]$Headers, [string]$OutputPath)\n\n  $sb = [System.Text.StringBuilder]::new()\n  [void]$sb.AppendLine(($Headers | ForEach-Object { \"`\"$_`\"\" }) -join ',')\n  foreach ($row in $Rows) {\n    $escaped = $row | ForEach-Object { \"`\"$([string]$_ -replace '\"', '\"\"')`\"\" }\n    [void]$sb.AppendLine($escaped -join ',')\n  }\n  $sb.ToString() | Out-File -FilePath $OutputPath -Encoding UTF8\n}\n\nfunction Export-ToMarkdown {\n  param([array]$Rows, [array]$Headers, [string]$OutputPath, [string]$Title)\n\n  $sb = [System.Text.StringBuilder]::new()\n  [void]$sb.AppendLine(\"# $Title\")\n  [void]$sb.AppendLine('')\n  [void]$sb.AppendLine(\"*Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')*\")\n  [void]$sb.AppendLine('')\n  [void]$sb.Append((Format-MarkdownTable -Headers $Headers -Rows $Rows))\n  [void]$sb.AppendLine('')\n  [void]$sb.AppendLine(\"*Total: $($Rows.Count) item(s)*\")\n  $sb.ToString() | Out-File -FilePath $OutputPath -Encoding UTF8\n}\n\nfunction Export-ToHtml {\n  param([array]$Rows, [array]$Headers, [string]$OutputPath, [string]$Title)\n\n  $sb = [System.Text.StringBuilder]::new()\n  [void]$sb.AppendLine('<!DOCTYPE html><html><head><meta charset=\"utf-8\">')\n  [void]$sb.AppendLine(\"<title>$([System.Web.HttpUtility]::HtmlEncode($Title))</title>\")\n  [void]$sb.AppendLine('<style>')\n  [void]$sb.AppendLine('body{font-family:Segoe UI,Arial,sans-serif;margin:20px;background:#f5f5f5;color:#333}')\n  [void]$sb.AppendLine('h1{color:#5b21b6;border-bottom:2px solid #5b21b6;padding-bottom:8px}')\n  [void]$sb.AppendLine('table{border-collapse:collapse;width:100%;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.1)}')\n  [void]$sb.AppendLine('th{background:#5b21b6;color:#fff;padding:10px 12px;text-align:left;font-weight:600}')\n  [void]$sb.AppendLine('td{padding:8px 12px;border-bottom:1px solid #e5e7eb}')\n  [void]$sb.AppendLine('tr:nth-child(even){background:#f9fafb}')\n  [void]$sb.AppendLine('tr:hover{background:#ede9fe}')\n  [void]$sb.AppendLine('.meta{color:#6b7280;font-size:.85em;margin:8px 0}')\n  [void]$sb.AppendLine('</style></head><body>')\n  [void]$sb.AppendLine(\"<h1>$([System.Web.HttpUtility]::HtmlEncode($Title))</h1>\")\n  [void]$sb.AppendLine(\"<p class='meta'>Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | Total: $($Rows.Count) item(s)</p>\")\n  [void]$sb.AppendLine('<table><thead><tr>')\n  foreach ($h in $Headers) { [void]$sb.Append(\"<th>$([System.Web.HttpUtility]::HtmlEncode($h))</th>\") }\n  [void]$sb.AppendLine('</tr></thead><tbody>')\n  foreach ($row in $Rows) {\n    [void]$sb.Append('<tr>')\n    foreach ($cell in $row) { [void]$sb.Append(\"<td>$([System.Web.HttpUtility]::HtmlEncode([string]$cell))</td>\") }\n    [void]$sb.AppendLine('</tr>')\n  }\n  [void]$sb.AppendLine('</tbody></table></body></html>')\n  $sb.ToString() | Out-File -FilePath $OutputPath -Encoding UTF8\n}\n\nfunction Export-ToXlsx {\n  param([array]$Rows, [array]$Headers, [string]$OutputPath, [string]$Title)\n\n  Install-ImportExcelModule\n\n  # Build objects for ImportExcel\n  $objects = [System.Collections.Generic.List[object]]::new()\n  foreach ($row in $Rows) {\n    $obj = [ordered]@{}\n    for ($i = 0; $i -lt $Headers.Count; $i++) {\n      $val = if ($i -lt $row.Count) { $row[$i] } else { '' }\n      $obj[$Headers[$i]] = $val\n    }\n    $objects.Add([pscustomobject]$obj)\n  }\n\n  $xlParams = @{\n    Path          = $OutputPath\n    WorksheetName = $Title.Substring(0, [Math]::Min(31, $Title.Length))\n    AutoSize      = $true\n    FreezeTopRow  = $true\n    BoldTopRow    = $true\n    TableStyle    = 'Medium6'\n  }\n\n  $objects | Export-Excel @xlParams\n}\n\n#endregion\n\n#region Emit List Results Helper\n\nfunction Emit-ListResults {\n  param(\n    [array]$RawResults,\n    [hashtable]$FieldDef,\n    [string]$ObjectType,\n    [string]$TypeName,\n    [hashtable]$Opts\n  )\n\n  if ($null -eq $RawResults) { $RawResults = @() }\n  $RawResults = @($RawResults)\n\n  Write-XYProgress 0.55 \"Processing $($RawResults.Count) result(s)...\"\n\n  $tableOutput = Build-TableOutput -RawResults $RawResults -FieldDef $FieldDef `\n    -ObjectType $ObjectType -Title \"Active Directory $TypeName\" -QueryOpts $Opts\n\n  Write-XYProgress 0.70 'Building output...'\n\n  # Build caption\n  $searchInfo = @()\n  if ($Opts.SearchBase) { $searchInfo += \"OU: $($Opts.SearchBase)\" }\n  if ($Opts.NameFilter) { $searchInfo += \"Filter: $($Opts.NameFilter)\" }\n  if ($Opts.EnabledOnly -and $ObjectType -in @('users', 'computers')) { $searchInfo += 'Enabled only' }\n  $searchInfo += \"Scope: $($Opts.SearchScope)\"\n  $searchInfo += \"Fields: $((Get-Culture).TextInfo.ToTitleCase($Opts.FieldSet))\"\n  $captionText = \"Found $($tableOutput.SortedResults.Count) $($TypeName.ToLower()) | $($searchInfo -join ' | ')\"\n\n  # Export\n  $generatedFiles = @()\n  if ($Opts.ExportEnabled) {\n    Write-XYProgress 0.85 \"Exporting to $($Opts.ExportFormat.ToUpper())...\"\n    $title = \"Active Directory $TypeName\"\n    $exportPath = Export-ResultsToFile -Rows $tableOutput.DataRows -Headers $tableOutput.ExportHeaders `\n      -Format $Opts.ExportFormat -FileName $Opts.ExportFileName -Title $title\n    if (Test-Path $exportPath) {\n      $fileInfo = Get-Item $exportPath\n      $generatedFiles += $fileInfo.Name\n      $sizeStr = if ($fileInfo.Length -ge 1MB) { \"{0:N2} MB\" -f ($fileInfo.Length / 1MB) }\n                 elseif ($fileInfo.Length -ge 1KB) { \"{0:N2} KB\" -f ($fileInfo.Length / 1KB) }\n                 else { \"$($fileInfo.Length) B\" }\n      $captionText += \" | Exported: $($fileInfo.Name) ($sizeStr)\"\n    }\n  }\n\n  # Emit table\n  Write-XY @{ table = @{\n    title   = \"Active Directory $TypeName\"\n    header  = $tableOutput.DisplayHeaders\n    rows    = $tableOutput.TableRows\n    caption = $captionText\n  } }\n\n  Write-XYProgress 0.95 'Completed'\n\n  return [PSCustomObject]@{\n    tool            = \"List $TypeName\"\n    success         = $true\n    objectType      = $ObjectType\n    fieldSet        = $Opts.FieldSet\n    totalResults    = $tableOutput.SortedResults.Count\n    items           = $tableOutput.OutputItems.ToArray()\n    fields          = $FieldDef.Fields\n    timestamp       = (Get-Date).ToString('o')\n    generatedFiles  = $generatedFiles\n  }\n}\n\n#endregion\n\n#region Main Entry Point\n\ntry {\n  $job = Read-JobFromStdin\n  $Params = $job.params\n  $tool = if ($Params.PSObject.Properties.Name -contains 'tool') { $Params.tool } else { 'listUsers' }\n  $Cwd = if ($job.PSObject.Properties.Name -contains 'cwd') { $job.cwd } else { $null }\n  if ($Cwd -and (Test-Path $Cwd -PathType Container)) { Set-Location $Cwd }\n\n  Write-XYProgress 0.02 'Starting AD Info...'\n\n  # Check AD module\n  Assert-ActiveDirectoryModule\n\n  $result = $null\n  switch ($tool) {\n    'listUsers'       { $result = Invoke-ADUserList -Params $Params }\n    'listGroups'      { $result = Invoke-ADGroupList -Params $Params }\n    'listComputers'   { $result = Invoke-ADComputerList -Params $Params }\n    'listOUs'         { $result = Invoke-ADOUList -Params $Params }\n    'groupMembership' { $result = Invoke-GroupMembership -Params $Params }\n    'groupMembers'    { $result = Invoke-GroupMembers -Params $Params }\n    'staleAccounts'   { $result = Invoke-StaleAccounts -Params $Params }\n    'passwordExpiry'  { $result = Invoke-PasswordExpiry -Params $Params }\n    'lockedAccounts'  { $result = Invoke-LockedAccounts -Params $Params }\n    'emptyGroups'     { $result = Invoke-EmptyGroups -Params $Params }\n    'domainInfo'      { $result = Invoke-DomainInfo -Params $Params }\n    'ldapQuery'       { $result = Invoke-LdapQuery -Params $Params }\n    'compareOUs'          { $result = Invoke-CompareOUs -Params $Params }\n    'privilegedAccounts'  { $result = Invoke-PrivilegedAccounts -Params $Params }\n    'serviceAccounts'     { $result = Invoke-ServiceAccounts -Params $Params }\n    'disabledAccounts'    { $result = Invoke-DisabledAccounts -Params $Params }\n    'passwordPolicy'      { $result = Invoke-PasswordPolicy -Params $Params }\n    'replicationStatus'   { $result = Invoke-ReplicationStatus -Params $Params }\n    'sitesAndSubnets'     { $result = Invoke-SitesAndSubnets -Params $Params }\n    'trustRelationships'  { $result = Invoke-TrustRelationships -Params $Params }\n    'gpoOverview'         { $result = Invoke-GPOOverview -Params $Params }\n    'userDetail'          { $result = Invoke-UserDetail -Params $Params }\n    'recentChanges'       { $result = Invoke-RecentChanges -Params $Params }\n    'accountExpiration'   { $result = Invoke-AccountExpiration -Params $Params }\n    'duplicateSPNs'       { $result = Invoke-DuplicateSPNs -Params $Params }\n    default               { throw \"Unknown tool: $tool\" }\n  }\n\n  # Ensure generatedFiles is an array\n  $filesArray = @()\n  if ($result.PSObject.Properties['generatedFiles'] -and $result.generatedFiles) {\n    $filesArray = @($result.generatedFiles)\n  }\n\n  $desc = if ($result.PSObject.Properties['totalResults']) {\n    \"$($result.tool): $($result.totalResults) result(s)\"\n  } else {\n    \"$($result.tool) completed successfully\"\n  }\n\n  Write-XYSuccess -Data $result -Files $filesArray -Description $desc\n  exit 0\n}\ncatch {\n  Write-XYError -Code 1 -Description $_.Exception.Message\n  exit 1\n}\n\n#endregion\n",
+				"groups": [],
+				"format": "",
+				"params": [
+					{
+						"id": "tool",
+						"title": "Tool",
+						"type": "toolset",
+						"caption": "Select an Active Directory tool.",
+						"locked": false,
+						"data": {
+							"tools": [
+								{
+									"id": "listUsers",
+									"title": "List Users",
+									"description": "Query and list Active Directory user accounts with customizable fields and filters.",
+									"fields": [
+										{
+											"id": "searchBase",
+											"title": "Search Base (OU)",
+											"type": "text",
+											"value": "",
+											"caption": "Distinguished name of the OU to search (e.g., OU=Staff,DC=contoso,DC=com). Leave empty for entire domain."
+										},
+										{
+											"id": "searchScope",
+											"title": "Search Scope",
+											"type": "select",
+											"value": "Subtree — Search entire subtree [subtree], OneLevel — Direct children only [onelevel], Base — Base object only [base]",
+											"caption": "How deep to search within the search base."
+										},
+										{
+											"id": "nameFilter",
+											"title": "Name Filter",
+											"type": "text",
+											"value": "",
+											"caption": "Wildcard filter for Name (e.g., *admin*, IT-*). Leave empty for all."
+										},
+										{
+											"id": "enabledOnly",
+											"title": "Enabled Only",
+											"type": "checkbox",
+											"value": false,
+											"caption": "Only return enabled user accounts."
+										},
+										{
+											"id": "fieldSet",
+											"title": "Field Set",
+											"type": "select",
+											"value": "Essential — Core fields (4 columns) [essential], Standard — Common fields (8 columns) [standard], Extended — Detailed fields (14 columns) [extended], All — Every available field [all]",
+											"caption": "Controls which columns are displayed."
+										},
+										{
+											"id": "sortBy",
+											"title": "Sort By",
+											"type": "select",
+											"value": "Name [name], Created Date [created], Modified Date [modified]",
+											"caption": "Sort results by this property."
+										},
+										{
+											"id": "sortOrder",
+											"title": "Sort Order",
+											"type": "select",
+											"value": "Ascending [ascending], Descending [descending]",
+											"caption": "Sort direction."
+										},
+										{
+											"id": "maxResults",
+											"title": "Max Results",
+											"type": "text",
+											"value": 1000,
+											"variant": "number",
+											"caption": "Maximum number of objects to return (1-10000)."
+										},
+										{
+											"id": "exportEnabled",
+											"title": "Export to File",
+											"type": "checkbox",
+											"value": false,
+											"caption": "Save results to a file for download or downstream workflows."
+										},
+										{
+											"id": "exportFormat",
+											"title": "Export Format",
+											"type": "select",
+											"value": "CSV [csv], Markdown [markdown], HTML [html], Excel (XLSX) [xlsx]",
+											"caption": "Format for the exported file."
+										},
+										{
+											"id": "exportFileName",
+											"title": "Export File Name",
+											"type": "text",
+											"value": "ad_export",
+											"caption": "Name of the export file (extension added automatically)."
+										}
+									]
+								},
+								{
+									"id": "listGroups",
+									"title": "List Groups",
+									"description": "Query and list Active Directory security and distribution groups.",
+									"fields": [
+										{
+											"id": "searchBase",
+											"title": "Search Base (OU)",
+											"type": "text",
+											"value": "",
+											"caption": "Distinguished name of the OU to search. Leave empty for entire domain."
+										},
+										{
+											"id": "searchScope",
+											"title": "Search Scope",
+											"type": "select",
+											"value": "Subtree — Search entire subtree [subtree], OneLevel — Direct children only [onelevel], Base — Base object only [base]",
+											"caption": "How deep to search within the search base."
+										},
+										{
+											"id": "nameFilter",
+											"title": "Name Filter",
+											"type": "text",
+											"value": "",
+											"caption": "Wildcard filter for Name (e.g., DL-*, SEC-*). Leave empty for all."
+										},
+										{
+											"id": "fieldSet",
+											"title": "Field Set",
+											"type": "select",
+											"value": "Essential — Core fields (4 columns) [essential], Standard — Common fields (6 columns) [standard], Extended — Detailed fields (10 columns) [extended], All — Every available field [all]",
+											"caption": "Controls which columns are displayed."
+										},
+										{
+											"id": "sortBy",
+											"title": "Sort By",
+											"type": "select",
+											"value": "Name [name], Created Date [created], Modified Date [modified]",
+											"caption": "Sort results by this property."
+										},
+										{
+											"id": "sortOrder",
+											"title": "Sort Order",
+											"type": "select",
+											"value": "Ascending [ascending], Descending [descending]",
+											"caption": "Sort direction."
+										},
+										{
+											"id": "maxResults",
+											"title": "Max Results",
+											"type": "text",
+											"value": 1000,
+											"variant": "number",
+											"caption": "Maximum number of objects to return (1-10000)."
+										},
+										{
+											"id": "exportEnabled",
+											"title": "Export to File",
+											"type": "checkbox",
+											"value": false,
+											"caption": "Save results to a file for download or downstream workflows."
+										},
+										{
+											"id": "exportFormat",
+											"title": "Export Format",
+											"type": "select",
+											"value": "CSV [csv], Markdown [markdown], HTML [html], Excel (XLSX) [xlsx]",
+											"caption": "Format for the exported file."
+										},
+										{
+											"id": "exportFileName",
+											"title": "Export File Name",
+											"type": "text",
+											"value": "ad_export",
+											"caption": "Name of the export file (extension added automatically)."
+										}
+									]
+								},
+								{
+									"id": "listComputers",
+									"title": "List Computers",
+									"description": "Query and list Active Directory computer accounts.",
+									"fields": [
+										{
+											"id": "searchBase",
+											"title": "Search Base (OU)",
+											"type": "text",
+											"value": "",
+											"caption": "Distinguished name of the OU to search. Leave empty for entire domain."
+										},
+										{
+											"id": "searchScope",
+											"title": "Search Scope",
+											"type": "select",
+											"value": "Subtree — Search entire subtree [subtree], OneLevel — Direct children only [onelevel], Base — Base object only [base]",
+											"caption": "How deep to search within the search base."
+										},
+										{
+											"id": "nameFilter",
+											"title": "Name Filter",
+											"type": "text",
+											"value": "",
+											"caption": "Wildcard filter for Name (e.g., SRV-*, DC-*). Leave empty for all."
+										},
+										{
+											"id": "enabledOnly",
+											"title": "Enabled Only",
+											"type": "checkbox",
+											"value": false,
+											"caption": "Only return enabled computer accounts."
+										},
+										{
+											"id": "fieldSet",
+											"title": "Field Set",
+											"type": "select",
+											"value": "Essential — Core fields (4 columns) [essential], Standard — Common fields (7 columns) [standard], Extended — Detailed fields (12 columns) [extended], All — Every available field [all]",
+											"caption": "Controls which columns are displayed."
+										},
+										{
+											"id": "sortBy",
+											"title": "Sort By",
+											"type": "select",
+											"value": "Name [name], Created Date [created], Modified Date [modified]",
+											"caption": "Sort results by this property."
+										},
+										{
+											"id": "sortOrder",
+											"title": "Sort Order",
+											"type": "select",
+											"value": "Ascending [ascending], Descending [descending]",
+											"caption": "Sort direction."
+										},
+										{
+											"id": "maxResults",
+											"title": "Max Results",
+											"type": "text",
+											"value": 1000,
+											"variant": "number",
+											"caption": "Maximum number of objects to return (1-10000)."
+										},
+										{
+											"id": "exportEnabled",
+											"title": "Export to File",
+											"type": "checkbox",
+											"value": false,
+											"caption": "Save results to a file for download or downstream workflows."
+										},
+										{
+											"id": "exportFormat",
+											"title": "Export Format",
+											"type": "select",
+											"value": "CSV [csv], Markdown [markdown], HTML [html], Excel (XLSX) [xlsx]",
+											"caption": "Format for the exported file."
+										},
+										{
+											"id": "exportFileName",
+											"title": "Export File Name",
+											"type": "text",
+											"value": "ad_export",
+											"caption": "Name of the export file (extension added automatically)."
+										}
+									]
+								},
+								{
+									"id": "listOUs",
+									"title": "List OUs",
+									"description": "Query and list Active Directory Organizational Units.",
+									"fields": [
+										{
+											"id": "searchBase",
+											"title": "Search Base (OU)",
+											"type": "text",
+											"value": "",
+											"caption": "Distinguished name of the OU to search. Leave empty for entire domain."
+										},
+										{
+											"id": "searchScope",
+											"title": "Search Scope",
+											"type": "select",
+											"value": "Subtree — Search entire subtree [subtree], OneLevel — Direct children only [onelevel], Base — Base object only [base]",
+											"caption": "How deep to search within the search base."
+										},
+										{
+											"id": "nameFilter",
+											"title": "Name Filter",
+											"type": "text",
+											"value": "",
+											"caption": "Wildcard filter for Name. Leave empty for all."
+										},
+										{
+											"id": "fieldSet",
+											"title": "Field Set",
+											"type": "select",
+											"value": "Essential — Core fields (3 columns) [essential], Standard — Common fields (6 columns) [standard], Extended — Detailed fields (8 columns) [extended], All — Every available field [all]",
+											"caption": "Controls which columns are displayed."
+										},
+										{
+											"id": "sortBy",
+											"title": "Sort By",
+											"type": "select",
+											"value": "Name [name], Created Date [created], Modified Date [modified]",
+											"caption": "Sort results by this property."
+										},
+										{
+											"id": "sortOrder",
+											"title": "Sort Order",
+											"type": "select",
+											"value": "Ascending [ascending], Descending [descending]",
+											"caption": "Sort direction."
+										},
+										{
+											"id": "maxResults",
+											"title": "Max Results",
+											"type": "text",
+											"value": 1000,
+											"variant": "number",
+											"caption": "Maximum number of objects to return (1-10000)."
+										},
+										{
+											"id": "exportEnabled",
+											"title": "Export to File",
+											"type": "checkbox",
+											"value": false,
+											"caption": "Save results to a file for download or downstream workflows."
+										},
+										{
+											"id": "exportFormat",
+											"title": "Export Format",
+											"type": "select",
+											"value": "CSV [csv], Markdown [markdown], HTML [html], Excel (XLSX) [xlsx]",
+											"caption": "Format for the exported file."
+										},
+										{
+											"id": "exportFileName",
+											"title": "Export File Name",
+											"type": "text",
+											"value": "ad_export",
+											"caption": "Name of the export file (extension added automatically)."
+										}
+									]
+								},
+								{
+									"id": "groupMembership",
+									"title": "Group Membership",
+									"description": "Look up all groups a user belongs to (recursive).",
+									"fields": [
+										{
+											"id": "targetUser",
+											"title": "Target User",
+											"type": "text",
+											"value": "",
+											"caption": "SamAccountName or Distinguished Name of the user to look up."
+										},
+										{
+											"id": "exportEnabled",
+											"title": "Export to File",
+											"type": "checkbox",
+											"value": false,
+											"caption": "Save results to a file for download or downstream workflows."
+										},
+										{
+											"id": "exportFormat",
+											"title": "Export Format",
+											"type": "select",
+											"value": "CSV [csv], Markdown [markdown], HTML [html], Excel (XLSX) [xlsx]",
+											"caption": "Format for the exported file."
+										},
+										{
+											"id": "exportFileName",
+											"title": "Export File Name",
+											"type": "text",
+											"value": "ad_export",
+											"caption": "Name of the export file (extension added automatically)."
+										}
+									]
+								},
+								{
+									"id": "groupMembers",
+									"title": "Group Members",
+									"description": "List all members of a group, optionally recursive.",
+									"fields": [
+										{
+											"id": "targetGroup",
+											"title": "Target Group",
+											"type": "text",
+											"value": "",
+											"caption": "Name, SamAccountName, or Distinguished Name of the group."
+										},
+										{
+											"id": "recursive",
+											"title": "Recursive",
+											"type": "checkbox",
+											"value": false,
+											"caption": "Include members of nested groups."
+										},
+										{
+											"id": "exportEnabled",
+											"title": "Export to File",
+											"type": "checkbox",
+											"value": false,
+											"caption": "Save results to a file for download or downstream workflows."
+										},
+										{
+											"id": "exportFormat",
+											"title": "Export Format",
+											"type": "select",
+											"value": "CSV [csv], Markdown [markdown], HTML [html], Excel (XLSX) [xlsx]",
+											"caption": "Format for the exported file."
+										},
+										{
+											"id": "exportFileName",
+											"title": "Export File Name",
+											"type": "text",
+											"value": "ad_export",
+											"caption": "Name of the export file (extension added automatically)."
+										}
+									]
+								},
+								{
+									"id": "staleAccounts",
+									"title": "Stale Accounts",
+									"description": "Find user and/or computer accounts with no logon activity in a specified number of days.",
+									"fields": [
+										{
+											"id": "staleDays",
+											"title": "Stale Days",
+											"type": "text",
+											"value": 90,
+											"variant": "number",
+											"caption": "Number of days without logon to consider an account stale."
+										},
+										{
+											"id": "staleObjectType",
+											"title": "Object Type",
+											"type": "select",
+											"value": "Users only [users], Computers only [computers], Both users and computers [both]",
+											"caption": "Type of accounts to check."
+										},
+										{
+											"id": "searchBase",
+											"title": "Search Base (OU)",
+											"type": "text",
+											"value": "",
+											"caption": "Distinguished name of the OU to search. Leave empty for entire domain."
+										},
+										{
+											"id": "exportEnabled",
+											"title": "Export to File",
+											"type": "checkbox",
+											"value": false,
+											"caption": "Save results to a file for download or downstream workflows."
+										},
+										{
+											"id": "exportFormat",
+											"title": "Export Format",
+											"type": "select",
+											"value": "CSV [csv], Markdown [markdown], HTML [html], Excel (XLSX) [xlsx]",
+											"caption": "Format for the exported file."
+										},
+										{
+											"id": "exportFileName",
+											"title": "Export File Name",
+											"type": "text",
+											"value": "ad_export",
+											"caption": "Name of the export file (extension added automatically)."
+										}
+									]
+								},
+								{
+									"id": "passwordExpiry",
+									"title": "Password Expiry",
+									"description": "Find users with passwords expiring within a specified number of days.",
+									"fields": [
+										{
+											"id": "expiryDays",
+											"title": "Expiry Days",
+											"type": "text",
+											"value": 14,
+											"variant": "number",
+											"caption": "Show users with passwords expiring within this many days."
+										},
+										{
+											"id": "searchBase",
+											"title": "Search Base (OU)",
+											"type": "text",
+											"value": "",
+											"caption": "Distinguished name of the OU to search. Leave empty for entire domain."
+										},
+										{
+											"id": "exportEnabled",
+											"title": "Export to File",
+											"type": "checkbox",
+											"value": false,
+											"caption": "Save results to a file for download or downstream workflows."
+										},
+										{
+											"id": "exportFormat",
+											"title": "Export Format",
+											"type": "select",
+											"value": "CSV [csv], Markdown [markdown], HTML [html], Excel (XLSX) [xlsx]",
+											"caption": "Format for the exported file."
+										},
+										{
+											"id": "exportFileName",
+											"title": "Export File Name",
+											"type": "text",
+											"value": "ad_export",
+											"caption": "Name of the export file (extension added automatically)."
+										}
+									]
+								},
+								{
+									"id": "lockedAccounts",
+									"title": "Locked Accounts",
+									"description": "Find all currently locked-out user accounts with lockout details.",
+									"fields": [
+										{
+											"id": "exportEnabled",
+											"title": "Export to File",
+											"type": "checkbox",
+											"value": false,
+											"caption": "Save results to a file for download or downstream workflows."
+										},
+										{
+											"id": "exportFormat",
+											"title": "Export Format",
+											"type": "select",
+											"value": "CSV [csv], Markdown [markdown], HTML [html], Excel (XLSX) [xlsx]",
+											"caption": "Format for the exported file."
+										},
+										{
+											"id": "exportFileName",
+											"title": "Export File Name",
+											"type": "text",
+											"value": "ad_export",
+											"caption": "Name of the export file (extension added automatically)."
+										}
+									]
+								},
+								{
+									"id": "emptyGroups",
+									"title": "Empty Groups",
+									"description": "Find groups with zero members for cleanup purposes.",
+									"fields": [
+										{
+											"id": "searchBase",
+											"title": "Search Base (OU)",
+											"type": "text",
+											"value": "",
+											"caption": "Distinguished name of the OU to search. Leave empty for entire domain."
+										},
+										{
+											"id": "exportEnabled",
+											"title": "Export to File",
+											"type": "checkbox",
+											"value": false,
+											"caption": "Save results to a file for download or downstream workflows."
+										},
+										{
+											"id": "exportFormat",
+											"title": "Export Format",
+											"type": "select",
+											"value": "CSV [csv], Markdown [markdown], HTML [html], Excel (XLSX) [xlsx]",
+											"caption": "Format for the exported file."
+										},
+										{
+											"id": "exportFileName",
+											"title": "Export File Name",
+											"type": "text",
+											"value": "ad_export",
+											"caption": "Name of the export file (extension added automatically)."
+										}
+									]
+								},
+								{
+									"id": "domainInfo",
+									"title": "Domain Info",
+									"description": "Display domain/forest details, FSMO roles, and domain controllers.",
+									"fields": []
+								},
+								{
+									"id": "ldapQuery",
+									"title": "LDAP Query",
+									"description": "Run a custom LDAP filter query against Active Directory.",
+									"fields": [
+										{
+											"id": "ldapFilter",
+											"title": "LDAP Filter",
+											"type": "text",
+											"value": "",
+											"caption": "LDAP filter expression (e.g., (&(objectClass=user)(department=IT)))."
+										},
+										{
+											"id": "ldapProperties",
+											"title": "Properties",
+											"type": "text",
+											"value": "Name,SamAccountName,ObjectClass",
+											"caption": "Comma-separated list of AD properties to return."
+										},
+										{
+											"id": "searchBase",
+											"title": "Search Base (OU)",
+											"type": "text",
+											"value": "",
+											"caption": "Distinguished name of the OU to search. Leave empty for entire domain."
+										},
+										{
+											"id": "maxResults",
+											"title": "Max Results",
+											"type": "text",
+											"value": 1000,
+											"variant": "number",
+											"caption": "Maximum number of objects to return (1-10000)."
+										},
+										{
+											"id": "exportEnabled",
+											"title": "Export to File",
+											"type": "checkbox",
+											"value": false,
+											"caption": "Save results to a file for download or downstream workflows."
+										},
+										{
+											"id": "exportFormat",
+											"title": "Export Format",
+											"type": "select",
+											"value": "CSV [csv], Markdown [markdown], HTML [html], Excel (XLSX) [xlsx]",
+											"caption": "Format for the exported file."
+										},
+										{
+											"id": "exportFileName",
+											"title": "Export File Name",
+											"type": "text",
+											"value": "ad_export",
+											"caption": "Name of the export file (extension added automatically)."
+										}
+									]
+								},
+								{
+									"id": "compareOUs",
+									"title": "Compare OUs",
+									"description": "Compare objects between two Organizational Units and show differences.",
+									"fields": [
+										{
+											"id": "compareOU1",
+											"title": "OU 1",
+											"type": "text",
+											"value": "",
+											"caption": "Distinguished name of the first OU (e.g., OU=Sales,DC=contoso,DC=com)."
+										},
+										{
+											"id": "compareOU2",
+											"title": "OU 2",
+											"type": "text",
+											"value": "",
+											"caption": "Distinguished name of the second OU."
+										},
+										{
+											"id": "compareObjectType",
+											"title": "Object Type",
+											"type": "select",
+											"value": "Users [users], Groups [groups], Computers [computers]",
+											"caption": "Type of objects to compare between the two OUs."
+										},
+										{
+											"id": "exportEnabled",
+											"title": "Export to File",
+											"type": "checkbox",
+											"value": false,
+											"caption": "Save results to a file for download or downstream workflows."
+										},
+										{
+											"id": "exportFormat",
+											"title": "Export Format",
+											"type": "select",
+											"value": "CSV [csv], Markdown [markdown], HTML [html], Excel (XLSX) [xlsx]",
+											"caption": "Format for the exported file."
+										},
+										{
+											"id": "exportFileName",
+											"title": "Export File Name",
+											"type": "text",
+											"value": "ad_export",
+											"caption": "Name of the export file (extension added automatically)."
+										}
+									]
+								},
+								{
+									"id": "privilegedAccounts",
+									"title": "Privileged Accounts",
+									"description": "Audit members of high-privilege groups (Domain Admins, Enterprise Admins, Schema Admins, etc.) with password age and logon info.",
+									"fields": [
+										{
+											"id": "exportEnabled",
+											"title": "Export to File",
+											"type": "checkbox",
+											"value": false,
+											"caption": "Save results to a file for download or downstream workflows."
+										},
+										{
+											"id": "exportFormat",
+											"title": "Export Format",
+											"type": "select",
+											"value": "CSV [csv], Markdown [markdown], HTML [html], Excel (XLSX) [xlsx]",
+											"caption": "Format for the exported file."
+										},
+										{
+											"id": "exportFileName",
+											"title": "Export File Name",
+											"type": "text",
+											"value": "ad_export",
+											"caption": "Name of the export file (extension added automatically)."
+										}
+									]
+								},
+								{
+									"id": "serviceAccounts",
+									"title": "Service Accounts",
+									"description": "Find user accounts with Service Principal Names (SPNs). Shows delegation settings and password age — useful for Kerberoasting risk assessment.",
+									"fields": [
+										{
+											"id": "searchBase",
+											"title": "Search Base (OU)",
+											"type": "text",
+											"value": "",
+											"caption": "Distinguished name of the OU to search. Leave empty for entire domain."
+										},
+										{
+											"id": "exportEnabled",
+											"title": "Export to File",
+											"type": "checkbox",
+											"value": false,
+											"caption": "Save results to a file for download or downstream workflows."
+										},
+										{
+											"id": "exportFormat",
+											"title": "Export Format",
+											"type": "select",
+											"value": "CSV [csv], Markdown [markdown], HTML [html], Excel (XLSX) [xlsx]",
+											"caption": "Format for the exported file."
+										},
+										{
+											"id": "exportFileName",
+											"title": "Export File Name",
+											"type": "text",
+											"value": "ad_export",
+											"caption": "Name of the export file (extension added automatically)."
+										}
+									]
+								},
+								{
+									"id": "disabledAccounts",
+									"title": "Disabled Accounts",
+									"description": "List all disabled user and/or computer accounts for cleanup review.",
+									"fields": [
+										{
+											"id": "disabledObjectType",
+											"title": "Object Type",
+											"type": "select",
+											"value": "Users only [users], Computers only [computers], Both users and computers [both]",
+											"caption": "Type of disabled accounts to find."
+										},
+										{
+											"id": "searchBase",
+											"title": "Search Base (OU)",
+											"type": "text",
+											"value": "",
+											"caption": "Distinguished name of the OU to search. Leave empty for entire domain."
+										},
+										{
+											"id": "exportEnabled",
+											"title": "Export to File",
+											"type": "checkbox",
+											"value": false,
+											"caption": "Save results to a file for download or downstream workflows."
+										},
+										{
+											"id": "exportFormat",
+											"title": "Export Format",
+											"type": "select",
+											"value": "CSV [csv], Markdown [markdown], HTML [html], Excel (XLSX) [xlsx]",
+											"caption": "Format for the exported file."
+										},
+										{
+											"id": "exportFileName",
+											"title": "Export File Name",
+											"type": "text",
+											"value": "ad_export",
+											"caption": "Name of the export file (extension added automatically)."
+										}
+									]
+								},
+								{
+									"id": "passwordPolicy",
+									"title": "Password Policy",
+									"description": "Show default domain password policy and fine-grained password policies (FGPPs) with complexity, lockout, and assignment details.",
+									"fields": [
+										{
+											"id": "exportEnabled",
+											"title": "Export to File",
+											"type": "checkbox",
+											"value": false,
+											"caption": "Save FGPP results to a file for download or downstream workflows."
+										},
+										{
+											"id": "exportFormat",
+											"title": "Export Format",
+											"type": "select",
+											"value": "CSV [csv], Markdown [markdown], HTML [html], Excel (XLSX) [xlsx]",
+											"caption": "Format for the exported file."
+										},
+										{
+											"id": "exportFileName",
+											"title": "Export File Name",
+											"type": "text",
+											"value": "ad_export",
+											"caption": "Name of the export file (extension added automatically)."
+										}
+									]
+								},
+								{
+									"id": "replicationStatus",
+									"title": "Replication Status",
+									"description": "Show AD replication health between domain controllers — last sync times, result status, and consecutive failures.",
+									"fields": [
+										{
+											"id": "exportEnabled",
+											"title": "Export to File",
+											"type": "checkbox",
+											"value": false,
+											"caption": "Save results to a file for download or downstream workflows."
+										},
+										{
+											"id": "exportFormat",
+											"title": "Export Format",
+											"type": "select",
+											"value": "CSV [csv], Markdown [markdown], HTML [html], Excel (XLSX) [xlsx]",
+											"caption": "Format for the exported file."
+										},
+										{
+											"id": "exportFileName",
+											"title": "Export File Name",
+											"type": "text",
+											"value": "ad_export",
+											"caption": "Name of the export file (extension added automatically)."
+										}
+									]
+								},
+								{
+									"id": "sitesAndSubnets",
+									"title": "Sites & Subnets",
+									"description": "Display AD site topology with associated subnets, site links, and locations.",
+									"fields": [
+										{
+											"id": "exportEnabled",
+											"title": "Export to File",
+											"type": "checkbox",
+											"value": false,
+											"caption": "Save results to a file for download or downstream workflows."
+										},
+										{
+											"id": "exportFormat",
+											"title": "Export Format",
+											"type": "select",
+											"value": "CSV [csv], Markdown [markdown], HTML [html], Excel (XLSX) [xlsx]",
+											"caption": "Format for the exported file."
+										},
+										{
+											"id": "exportFileName",
+											"title": "Export File Name",
+											"type": "text",
+											"value": "ad_export",
+											"caption": "Name of the export file (extension added automatically)."
+										}
+									]
+								},
+								{
+									"id": "trustRelationships",
+									"title": "Trust Relationships",
+									"description": "List domain and forest trust relationships with direction, type, transitivity, and authentication details.",
+									"fields": [
+										{
+											"id": "exportEnabled",
+											"title": "Export to File",
+											"type": "checkbox",
+											"value": false,
+											"caption": "Save results to a file for download or downstream workflows."
+										},
+										{
+											"id": "exportFormat",
+											"title": "Export Format",
+											"type": "select",
+											"value": "CSV [csv], Markdown [markdown], HTML [html], Excel (XLSX) [xlsx]",
+											"caption": "Format for the exported file."
+										},
+										{
+											"id": "exportFileName",
+											"title": "Export File Name",
+											"type": "text",
+											"value": "ad_export",
+											"caption": "Name of the export file (extension added automatically)."
+										}
+									]
+								},
+								{
+									"id": "gpoOverview",
+									"title": "GPO Overview",
+									"description": "List all Group Policy Objects with status, version info, and link locations. Requires the GroupPolicy RSAT module.",
+									"fields": [
+										{
+											"id": "exportEnabled",
+											"title": "Export to File",
+											"type": "checkbox",
+											"value": false,
+											"caption": "Save results to a file for download or downstream workflows."
+										},
+										{
+											"id": "exportFormat",
+											"title": "Export Format",
+											"type": "select",
+											"value": "CSV [csv], Markdown [markdown], HTML [html], Excel (XLSX) [xlsx]",
+											"caption": "Format for the exported file."
+										},
+										{
+											"id": "exportFileName",
+											"title": "Export File Name",
+											"type": "text",
+											"value": "ad_export",
+											"caption": "Name of the export file (extension added automatically)."
+										}
+									]
+								},
+								{
+									"id": "userDetail",
+									"title": "User Detail",
+									"description": "Deep dive into a single user account — identity, organization, account status, group memberships, and direct reports.",
+									"fields": [
+										{
+											"id": "targetUser",
+											"title": "Target User",
+											"type": "text",
+											"value": "",
+											"caption": "SamAccountName or Distinguished Name of the user to look up."
+										},
+										{
+											"id": "exportEnabled",
+											"title": "Export to File",
+											"type": "checkbox",
+											"value": false,
+											"caption": "Save results to a file for download or downstream workflows."
+										},
+										{
+											"id": "exportFormat",
+											"title": "Export Format",
+											"type": "select",
+											"value": "CSV [csv], Markdown [markdown], HTML [html], Excel (XLSX) [xlsx]",
+											"caption": "Format for the exported file."
+										},
+										{
+											"id": "exportFileName",
+											"title": "Export File Name",
+											"type": "text",
+											"value": "ad_export",
+											"caption": "Name of the export file (extension added automatically)."
+										}
+									]
+								},
+								{
+									"id": "recentChanges",
+									"title": "Recent Changes",
+									"description": "Find AD objects created or modified within a specified number of days — an audit trail for recent activity.",
+									"fields": [
+										{
+											"id": "changeDays",
+											"title": "Days",
+											"type": "text",
+											"value": 7,
+											"variant": "number",
+											"caption": "Show changes from the last N days."
+										},
+										{
+											"id": "changeType",
+											"title": "Change Type",
+											"type": "select",
+											"value": "Both created and modified [both], Created only [created], Modified only [modified]",
+											"caption": "Type of changes to include."
+										},
+										{
+											"id": "changeObjectType",
+											"title": "Object Type",
+											"type": "select",
+											"value": "All objects [all], Users [users], Groups [groups], Computers [computers]",
+											"caption": "Filter by object type."
+										},
+										{
+											"id": "searchBase",
+											"title": "Search Base (OU)",
+											"type": "text",
+											"value": "",
+											"caption": "Distinguished name of the OU to search. Leave empty for entire domain."
+										},
+										{
+											"id": "maxResults",
+											"title": "Max Results",
+											"type": "text",
+											"value": 500,
+											"variant": "number",
+											"caption": "Maximum number of objects to return (1-10000)."
+										},
+										{
+											"id": "exportEnabled",
+											"title": "Export to File",
+											"type": "checkbox",
+											"value": false,
+											"caption": "Save results to a file for download or downstream workflows."
+										},
+										{
+											"id": "exportFormat",
+											"title": "Export Format",
+											"type": "select",
+											"value": "CSV [csv], Markdown [markdown], HTML [html], Excel (XLSX) [xlsx]",
+											"caption": "Format for the exported file."
+										},
+										{
+											"id": "exportFileName",
+											"title": "Export File Name",
+											"type": "text",
+											"value": "ad_export",
+											"caption": "Name of the export file (extension added automatically)."
+										}
+									]
+								},
+								{
+									"id": "accountExpiration",
+									"title": "Account Expiration",
+									"description": "Find user accounts whose account (not password) is expiring within a specified number of days.",
+									"fields": [
+										{
+											"id": "accountExpiryDays",
+											"title": "Expiry Days",
+											"type": "text",
+											"value": 30,
+											"variant": "number",
+											"caption": "Show accounts expiring within this many days."
+										},
+										{
+											"id": "searchBase",
+											"title": "Search Base (OU)",
+											"type": "text",
+											"value": "",
+											"caption": "Distinguished name of the OU to search. Leave empty for entire domain."
+										},
+										{
+											"id": "exportEnabled",
+											"title": "Export to File",
+											"type": "checkbox",
+											"value": false,
+											"caption": "Save results to a file for download or downstream workflows."
+										},
+										{
+											"id": "exportFormat",
+											"title": "Export Format",
+											"type": "select",
+											"value": "CSV [csv], Markdown [markdown], HTML [html], Excel (XLSX) [xlsx]",
+											"caption": "Format for the exported file."
+										},
+										{
+											"id": "exportFileName",
+											"title": "Export File Name",
+											"type": "text",
+											"value": "ad_export",
+											"caption": "Name of the export file (extension added automatically)."
+										}
+									]
+								},
+								{
+									"id": "duplicateSPNs",
+									"title": "Duplicate SPNs",
+									"description": "Scan all accounts for duplicate Service Principal Names — duplicates silently break Kerberos authentication.",
+									"fields": [
+										{
+											"id": "exportEnabled",
+											"title": "Export to File",
+											"type": "checkbox",
+											"value": false,
+											"caption": "Save results to a file for download or downstream workflows."
+										},
+										{
+											"id": "exportFormat",
+											"title": "Export Format",
+											"type": "select",
+											"value": "CSV [csv], Markdown [markdown], HTML [html], Excel (XLSX) [xlsx]",
+											"caption": "Format for the exported file."
+										},
+										{
+											"id": "exportFileName",
+											"title": "Export File Name",
+											"type": "text",
+											"value": "ad_export",
+											"caption": "Name of the export file (extension added automatically)."
+										}
+									]
+								}
+							]
+						}
+					}
+				],
+				"notes": "",
+				"icon": "account-group-outline",
+				"uid": "",
+				"gid": "",
+				"kill": "none",
+				"runner": false
+			}
+		}
+	]
+}
