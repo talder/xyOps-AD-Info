@@ -481,3 +481,5 @@ The plugin applies intelligent formatting to raw AD values:
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE.md](LICENSE.md) file for details.
+
+(c) 2026 Tim Alderweireldt
